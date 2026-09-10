@@ -62,8 +62,8 @@ activation_code = st.sidebar.text_input("请输入激活码解锁核心功能", 
 
 # 用户数据库：激活码 -> 到期日期
 VIP_DATABASE = {
-    "niuniu888": "2027-12-31",
-    "test001": "2026-9-30",
+    "niuniu888": "2026-12-31",
+    "test001": "2026-9-31",
 }
 
 if activation_code not in VIP_DATABASE:
@@ -109,15 +109,23 @@ def _bind_picker_logs(placeholder) -> None:
 
 def _pretty_result_table(picked: pd.DataFrame) -> pd.DataFrame:
     """把引擎返回的结果整理成网页表格。"""
+    open_px = pd.to_numeric(picked["今开"], errors="coerce")
+    prev_close = pd.to_numeric(picked["昨收"], errors="coerce")
+    # 建议入场价 = 9:25 今开；硬性止损 = max(昨收零轴, 今开下跌3.5%)
+    suggest_entry = open_px.round(2)
+    hard_stop = pd.concat([prev_close, open_px * 0.965], axis=1).max(axis=1).round(2)
+
     show = pd.DataFrame(
         {
             "股票代码": picked["代码"].astype(str),
             "股票名称": picked["名称"].astype(str),
             "昨日连板": picked["连板数"].map(picker.format_lianban),
             "昨日换手(%)": pd.to_numeric(picked["换手率"], errors="coerce").round(2),
-            "昨收": pd.to_numeric(picked["昨收"], errors="coerce").round(2),
-            "今开": pd.to_numeric(picked["今开"], errors="coerce").round(2),
+            "昨收": prev_close.round(2),
+            "今开": open_px.round(2),
             "今日高开(%)": (pd.to_numeric(picked["高开幅度"], errors="coerce") * 100).round(2),
+            "建议入场价": suggest_entry,
+            "硬性止损位": hard_stop,
         }
     )
     if "所属行业" in picked.columns:
@@ -228,6 +236,8 @@ if st.button("🔫 启动 9:25 终极选股策略"):
                             "昨收": st.column_config.NumberColumn("昨收", format="%.2f"),
                             "今开": st.column_config.NumberColumn("今开", format="%.2f"),
                             "今日高开(%)": st.column_config.NumberColumn("今日高开(%)", format="%+.2f"),
+                            "建议入场价": st.column_config.NumberColumn("建议入场价", format="%.2f"),
+                            "硬性止损位": st.column_config.NumberColumn("硬性止损位", format="%.2f"),
                         },
                     )
 
