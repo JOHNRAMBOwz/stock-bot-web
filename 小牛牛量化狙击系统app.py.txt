@@ -1,0 +1,118 @@
+import streamlit as st
+import akshare as ak
+import pandas as pd
+
+# --- 页面基本设置（深度定制 Stock-Bot 专属名字） ---
+st.set_page_config(page_title="小牛牛量化狙击系统", layout="wide", page_icon="🤖")
+
+# --- 侧边栏：商业化收费验证模块 ---
+st.sidebar.title("🤖 Stock-Bot 系统")
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔐 VIP 用户验证")
+activation_code = st.sidebar.text_input("请输入激活码解锁核心功能", type="password")
+
+# 这里设置你专属的密码
+VIP_CODE = "niuniu888" 
+
+if activation_code != VIP_CODE:
+    st.warning("⚠️ 欢迎来到 Stock-Bot 量化系统。请输入有效的 VIP 激活码以解锁选股策略。")
+    st.sidebar.error("🔴 未激活状态")
+    st.sidebar.info("购买激活码请联系管理员微信。")
+    st.stop() # 密码不对，程序就停在这里，不显示下面的核心内容
+else:
+    st.sidebar.success("🟢 尊贵的 VIP，验证通过！")
+    st.sidebar.markdown("---")
+    st.sidebar.write("👤 用户：顶级游资")
+    st.sidebar.write("⏳ 到期时间：2099-12-31")
+
+# --- 主页面内容 ---
+st.title("🎯 Stock-Bot 核心打板/竞价系统")
+st.markdown("用绝对的理性，对抗人性的贪婪与恐惧。")
+st.markdown("---")
+
+# === 模块一：市场情绪监控 ===
+st.header("📊 模块一：全局情绪温度计")
+if st.button("🔄 点击获取今日最新情绪数据"):
+    with st.spinner("Stock-Bot 正在高速连接交易所服务器..."):
+        try:
+            df_zt = ak.stock_zt_pool_em() # 涨停池
+            df_dt = ak.stock_zt_pool_dtgc_em() # 跌停池
+            
+            # 美化数据展示
+            col1, col2, col3 = st.columns(3)
+            col1.metric("🔥 今日涨停家数", f"{len(df_zt)} 家", "赚钱效应")
+            if df_dt.empty:
+                col2.metric("🧊 今日跌停家数", "0 家", "亏钱效应")
+            else:
+                col2.metric("🧊 今日跌停家数", f"{len(df_dt)} 家", "-亏钱效应")
+            
+            # 统计最高连板
+            if not df_zt.empty and '连板数' in df_zt.columns:
+                max_lb = df_zt['连板数'].max()
+                col3.metric("🚀 市场最高连板 (天花板)", f"{max_lb} 板", "情绪高度")
+                
+                st.subheader(f"🏆 核心连板梯队 (只显示2连板及以上)")
+                df_lb = df_zt[df_zt['连板数'] >= 2].sort_values(by='连板数', ascending=False)
+                st.dataframe(df_lb[['代码', '名称', '最新价', '涨跌幅', '连板数', '所属行业']], use_container_width=True)
+                
+        except Exception as e:
+            st.error(f"数据获取失败，可能由于非交易时间或接口限制：{e}")
+
+st.markdown("---")
+
+# === 模块二：9:25 核心狙击系统 ===
+st.header("⚡ 模块二：9:25 集合竞价『弱转强』狙击")
+st.info("💡 操作指南：请在交易日早上 9:25 分 05秒 之后点击下方按钮，抓取竞价抢筹龙头。")
+
+if st.button("🔫 启动 9:25 终极选股策略"):
+    with st.spinner("Stock-Bot 正在全网扫描超预期『弱转强』标的..."):
+        try:
+            # 1. 抓昨天涨停
+            df_zt = ak.stock_zt_pool_em()
+            # 筛选昨天换手 10%-30%，剔除 ST和科创创业
+            df_zt = df_zt[(df_zt['换手率'] >= 10) & (df_zt['换手率'] <= 30)]
+            df_zt = df_zt[~df_zt['名称'].str.contains('ST')]
+            df_zt = df_zt[~df_zt['代码'].str.startswith('688')]
+            df_zt = df_zt[~df_zt['代码'].str.startswith('300')]
+            target_codes = df_zt['代码'].tolist()
+
+            if not target_codes:
+                st.warning("昨日无符合换手率条件的股票，今日空仓。")
+            else:
+                # 2. 抓今日开盘快照
+                df_spot = ak.stock_zh_a_spot_em()
+                df_match = df_spot[df_spot['代码'].isin(target_codes)]
+                
+                results = []
+                for index, row in df_match.iterrows():
+                    code = row['代码']
+                    name = row['名称']
+                    open_price = row['今开']
+                    prev_close = row['昨收']
+                    
+                    if open_price == 0 or pd.isna(open_price) or prev_close == 0:
+                        continue
+                        
+                    gap_up_pct = (open_price - prev_close) / prev_close * 100
+                    lianban = df_zt[df_zt['代码'] == code]['连板数'].values[0]
+                    huanshou = df_zt[df_zt['代码'] == code]['换手率'].values[0]
+
+                    # 3% 到 9% 的高开
+                    if 3.0 <= gap_up_pct <= 9.0:
+                        results.append({
+                            '股票代码': code,
+                            '股票名称': name,
+                            '昨日连板': lianban,
+                            '昨日换手(%)': round(huanshou, 2),
+                            '今日高开(%)': round(gap_up_pct, 2)
+                        })
+                
+                if results:
+                    st.success(f"🎉 狙击成功！Stock-Bot 发现 {len(results)} 只符合黄金买点的标的！")
+                    df_res = pd.DataFrame(results)
+                    st.dataframe(df_res, use_container_width=True)
+                else:
+                    st.error("😭 竞价结束，未发现符合 3%-9% 高开条件的股票。执行纪律：管住手！")
+                    
+        except Exception as e:
+            st.error(f"运行报错：{e}")
