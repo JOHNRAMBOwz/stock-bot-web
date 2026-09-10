@@ -63,7 +63,7 @@ activation_code = st.sidebar.text_input("请输入激活码解锁核心功能", 
 # 用户数据库：激活码 -> 到期日期
 VIP_DATABASE = {
     "niuniu888": "2027-12-31",
-    "test001": "2026-9-31",
+    "test001": "2026-9-30",
 }
 
 if activation_code not in VIP_DATABASE:
