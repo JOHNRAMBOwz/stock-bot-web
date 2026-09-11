@@ -53,9 +53,9 @@ import auction_picker as picker
 # ---------------------------------------------------------------------------
 # 页面与 VIP
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="小牛牛量化狙击系统", layout="wide", page_icon="🤖")
+st.set_page_config(page_title="WZ Breaker - A股情绪动量模型", layout="wide", page_icon="🤖")
 
-st.sidebar.title("🤖 Stock-Bot 系统")
+st.sidebar.title("WZ Breaker")
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔐 VIP 用户验证")
 activation_code = st.sidebar.text_input("请输入激活码解锁核心功能", type="password")
@@ -67,9 +67,12 @@ VIP_DATABASE = {
 }
 
 if activation_code not in VIP_DATABASE:
-    st.warning("⚠️ 欢迎来到 Stock-Bot 量化系统。请输入有效的 VIP 激活码以解锁选股策略。")
+    st.warning("⚠️ 欢迎来到 WZ Breaker - A股情绪动量模型。请输入有效的 VIP 激活码以解锁选股策略。")
     st.sidebar.error("无效激活码")
     st.sidebar.info("购买激活码请联系管理员微信。")
+    st.sidebar.markdown("**微信：azxc139210**")
+    st.markdown("购买激活码请联系管理员微信。")
+    st.markdown("**微信：azxc139210**")
     st.stop()
 
 expire_str = VIP_DATABASE[activation_code]
@@ -86,7 +89,7 @@ st.sidebar.write("👤 用户：顶级游资")
 st.sidebar.write(f"⏳ 到期时间：{expire_str}")
 
 
-st.title("🎯 Stock-Bot 核心打板/竞价系统")
+st.title("WZ Breaker - A股情绪动量模型")
 st.markdown("用绝对的理性，对抗人性的贪婪与恐惧。")
 st.markdown("---")
 
