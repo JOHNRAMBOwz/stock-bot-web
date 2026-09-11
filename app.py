@@ -51,21 +51,162 @@ import streamlit as st
 import auction_picker as picker
 
 
-def get_spot_data_with_retry(max_retries=3, delay=2):
-    """获取全市场实时行情。失败后等待再试，避免免费接口被瞬间掐断。"""
+def _normalize_code_series(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.replace(".0", "", regex=False)
+    s = s.str.replace(r"^(sh|sz|bj)", "", regex=True, case=False)
+    return s.str.zfill(6)
+
+
+def _to_numeric_cols(df: pd.DataFrame, cols) -> pd.DataFrame:
+    for col in cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _normalize_tencent_spot(raw: pd.DataFrame) -> pd.DataFrame:
+    """把腾讯 rank_list 英文字段映射成系统统一中文列名。"""
+    rename_map = {
+        "code": "代码",
+        "name": "名称",
+        "zxj": "最新价",
+        "zdf": "涨跌幅",
+        "zd": "涨跌额",
+        "hsl": "换手率",
+        "lb": "量比",
+        "zsz": "总市值_亿元",
+        "ltsz": "流通市值_亿元",
+        "pe_ttm": "市盈率-动态",
+        "zdf_d60": "60日涨跌幅",
+        "zdf_y": "年初至今涨跌幅",
+        "volume": "成交量",
+        "turnover": "成交额",
+        "zf": "振幅",
+    }
+    df = raw.rename(columns={k: v for k, v in rename_map.items() if k in raw.columns}).copy()
+    if "代码" not in df.columns:
+        raise ValueError(f"腾讯行情缺少代码字段，实际列名：{list(raw.columns)}")
+    df["代码"] = _normalize_code_series(df["代码"])
+    df = _to_numeric_cols(
+        df,
+        [
+            "最新价",
+            "涨跌幅",
+            "涨跌额",
+            "换手率",
+            "量比",
+            "总市值_亿元",
+            "流通市值_亿元",
+            "市盈率-动态",
+            "60日涨跌幅",
+            "年初至今涨跌幅",
+            "成交量",
+            "成交额",
+            "振幅",
+        ],
+    )
+    if "总市值_亿元" in df.columns:
+        df["总市值"] = df["总市值_亿元"] * 100000000
+    return df
+
+
+def _normalize_sina_spot(raw: pd.DataFrame) -> pd.DataFrame:
+    """新浪官方接口列名已是中文：今开 / 昨收 / 最高 等。"""
+    df = raw.copy()
+    aliases = {
+        "开盘": "今开",
+        "昨收盘": "昨收",
+        "收盘": "最新价",
+        "涨跌幅度": "涨跌幅",
+    }
+    df = df.rename(columns={k: v for k, v in aliases.items() if k in df.columns and v not in df.columns})
+    if "代码" not in df.columns:
+        raise ValueError(f"新浪行情缺少代码字段，实际列名：{list(raw.columns)}")
+    df["代码"] = _normalize_code_series(df["代码"])
+    df = _to_numeric_cols(df, ["最新价", "涨跌幅", "今开", "昨收", "最高", "最低", "成交量", "成交额"])
+    return df
+
+
+def _fill_derived_prices(df: pd.DataFrame) -> pd.DataFrame:
+    """腾讯榜单没有今开/昨收/最高时，用现价和涨跌幅尽量补齐。"""
+    df = df.copy()
+    df = _to_numeric_cols(df, ["最新价", "涨跌幅", "今开", "昨收", "最高"])
+    if "昨收" not in df.columns:
+        df["昨收"] = pd.NA
+    need_prev = df["昨收"].isna() | (df["昨收"] <= 0)
+    if need_prev.any():
+        df.loc[need_prev, "昨收"] = df.loc[need_prev, "最新价"] / (1 + df.loc[need_prev, "涨跌幅"] / 100.0)
+    if "今开" not in df.columns:
+        df["今开"] = pd.NA
+    need_open = df["今开"].isna() | (df["今开"] <= 0)
+    if need_open.any():
+        # 9:25 竞价刚结束时最新价≈今开；盘中则作为兜底，避免模块二直接崩溃
+        df.loc[need_open, "今开"] = df.loc[need_open, "最新价"]
+    return df
+
+
+def _try_fetch_spot(fetcher, desc: str, max_retries: int, delay: float):
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            df = ak.stock_zh_a_spot_em()
+            print(f"正在{desc}（第 {attempt}/{max_retries} 次）...")
+            df = fetcher()
             if df is None or (hasattr(df, "empty") and df.empty):
-                raise ValueError("全市场行情接口返回为空")
+                raise ValueError("接口返回了空表格")
+            print(f"{desc}完成，共 {len(df)} 行。")
             return df
         except Exception as exc:
             last_error = exc
-            print(f"警告：获取全市场行情失败（第 {attempt}/{max_retries} 次）：{exc}")
+            print(f"警告：{desc}失败（第 {attempt}/{max_retries} 次）：{exc}")
             if attempt < max_retries:
                 time.sleep(delay)
-    raise RuntimeError(f"获取全市场行情连续失败 {max_retries} 次：{last_error}")
+    raise RuntimeError(f"{desc}连续失败 {max_retries} 次：{last_error}")
+
+
+def get_spot_data_with_retry(max_retries=3, delay=2, need_ohlc=False) -> pd.DataFrame:
+    """
+    全市场快照：优先腾讯 ak.stock_zh_a_spot_tx()，失败再走新浪 ak.stock_zh_a_spot()。
+    不再使用东方财富 stock_zh_a_spot_em，避免 Connection aborted。
+    need_ohlc=True 时会再补一次新浪，用于模块三需要的今开、昨收、最高。
+    """
+    tx_df = None
+    sina_df = None
+    errors = []
+
+    try:
+        tx_df = _try_fetch_spot(
+            lambda: _normalize_tencent_spot(ak.stock_zh_a_spot_tx()),
+            desc="获取腾讯全市场行情",
+            max_retries=max_retries,
+            delay=delay,
+        )
+    except Exception as exc:
+        errors.append(str(exc))
+        print(f"警告：腾讯接口不可用，准备切换新浪：{exc}")
+
+    should_fetch_sina = tx_df is None or need_ohlc
+    if should_fetch_sina:
+        sina_retries = 1 if tx_df is not None else max_retries
+        try:
+            sina_df = _try_fetch_spot(
+                lambda: _normalize_sina_spot(ak.stock_zh_a_spot()),
+                desc="获取新浪全市场行情",
+                max_retries=sina_retries,
+                delay=delay,
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+            print(f"警告：新浪接口不可用：{exc}")
+
+    if tx_df is not None and sina_df is not None:
+        ohlc_cols = [c for c in ["代码", "今开", "昨收", "最高", "最低"] if c in sina_df.columns]
+        merged = tx_df.merge(sina_df[ohlc_cols].drop_duplicates("代码"), on="代码", how="left")
+        return _fill_derived_prices(merged)
+    if tx_df is not None:
+        return _fill_derived_prices(tx_df)
+    if sina_df is not None:
+        return _fill_derived_prices(sina_df)
+    raise RuntimeError("腾讯与新浪全市场行情均失败：{}".format("；".join(errors)))
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +423,7 @@ if st.button("🔫 启动 9:25 终极选股策略"):
                 )
                 st.write(f"👀 进入今日竞价观察的候选：**{len(candidates)}** 只。{preview}")
 
-                # 核心：带校验与重试的全市场今开价快照
+                # 核心：模块二仍走东方财富全市场快照（该接口对竞价时段可用）
                 spot = picker.fetch_today_spot()
                 picked = picker.match_weak_to_strong(candidates, spot)
 
@@ -336,32 +477,27 @@ st.info("💡 操作指南：请在交易日下午 14:50 左右点击运行。�
 if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
     with st.spinner("WZ Breaker 正在扫描尾盘强资金抢筹标的..."):
         try:
-            df_spot = get_spot_data_with_retry()
+            df_spot = get_spot_data_with_retry(need_ohlc=True)
             if df_spot is None or df_spot.empty:
                 raise ValueError("全市场行情接口返回为空")
 
-            required = {"代码", "名称", "最新价", "涨跌幅", "换手率", "最高"}
-            missing = required - set(df_spot.columns)
-            if missing:
-                raise ValueError(f"行情缺少字段：{missing}")
-
             df = df_spot.copy()
-            df["代码"] = df["代码"].astype(str).str.replace(".0", "", regex=False).str.zfill(6)
-            df["涨跌幅"] = pd.to_numeric(df["涨跌幅"], errors="coerce")
-            df["换手率"] = pd.to_numeric(df["换手率"], errors="coerce")
-            df["最新价"] = pd.to_numeric(df["最新价"], errors="coerce")
-            df["最高"] = pd.to_numeric(df["最高"], errors="coerce")
+            df["代码"] = _normalize_code_series(df["代码"])
+            df = _to_numeric_cols(df, ["涨跌幅", "换手率", "最新价", "最高"])
 
             df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
             df = df[~df["代码"].str.startswith("688")]
             df = df[~df["代码"].str.startswith("300")]
             df = df[(df["涨跌幅"] >= 3.0) & (df["涨跌幅"] <= 7.0)]
-            df = df[df["换手率"] >= 5.0]
-            df = df[df["最高"] > 0]
-            df = df[df["最新价"] >= df["最高"] * 0.985]
+            if "换手率" in df.columns:
+                df = df[df["换手率"] >= 5.0]
+            if "最高" in df.columns:
+                df = df[df["最高"] > 0]
+                df = df[df["最新价"] >= df["最高"] * 0.985]
 
-            show_cols = ["代码", "名称", "最新价", "涨跌幅", "换手率", "最高"]
-            df_res = df[show_cols].sort_values(by=["涨跌幅", "换手率"], ascending=False).reset_index(drop=True)
+            show_cols = [c for c in ["代码", "名称", "最新价", "涨跌幅", "换手率", "最高"] if c in df.columns]
+            sort_cols = [c for c in ["涨跌幅", "换手率"] if c in df.columns]
+            df_res = df[show_cols].sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
 
             if df_res.empty:
                 st.error("今日尾盘无符合强资金抢筹特征的标的，管住手")
@@ -401,31 +537,32 @@ if st.button("📡 启动趋势雷达扫描"):
             if df_spot is None or df_spot.empty:
                 raise ValueError("全市场行情接口返回为空")
 
-            required = {"代码", "名称", "最新价", "涨跌幅", "量比", "60日涨跌幅", "总市值", "换手率"}
-            missing = required - set(df_spot.columns)
-            if missing:
-                raise ValueError(f"行情缺少字段：{missing}")
-
             df = df_spot.copy()
-            df["代码"] = df["代码"].astype(str).str.replace(".0", "", regex=False).str.zfill(6)
-            df["最新价"] = pd.to_numeric(df["最新价"], errors="coerce")
-            df["涨跌幅"] = pd.to_numeric(df["涨跌幅"], errors="coerce")
-            df["量比"] = pd.to_numeric(df["量比"], errors="coerce")
-            df["60日涨跌幅"] = pd.to_numeric(df["60日涨跌幅"], errors="coerce")
-            df["总市值"] = pd.to_numeric(df["总市值"], errors="coerce")
-            df["换手率"] = pd.to_numeric(df["换手率"], errors="coerce")
+            df["代码"] = _normalize_code_series(df["代码"])
+            df = _to_numeric_cols(df, ["最新价", "涨跌幅", "量比", "60日涨跌幅", "总市值", "换手率"])
 
             df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
             df = df[~df["代码"].str.startswith("688")]
             df = df[~df["代码"].str.startswith("300")]
-            df = df[(df["总市值"] >= 5000000000) & (df["总市值"] <= 50000000000)]
-            df = df[(df["60日涨跌幅"] >= 20) & (df["60日涨跌幅"] <= 80)]
-            df = df[(df["量比"] >= 2.0) & (df["涨跌幅"] >= 4.0) & (df["涨跌幅"] <= 8.0)]
-            df = df[df["换手率"] >= 5.0]
+            df = df[(df["涨跌幅"] >= 4.0) & (df["涨跌幅"] <= 8.0)]
+            if "总市值" in df.columns:
+                df = df[(df["总市值"] >= 5000000000) & (df["总市值"] <= 50000000000)]
+            if "60日涨跌幅" in df.columns:
+                df = df[(df["60日涨跌幅"] >= 20) & (df["60日涨跌幅"] <= 80)]
+            if "量比" in df.columns:
+                df = df[df["量比"] >= 2.0]
+            elif "成交额" in df.columns:
+                df["成交额"] = pd.to_numeric(df["成交额"], errors="coerce")
+                cutoff = df["成交额"].quantile(0.7)
+                df = df[df["成交额"] >= cutoff]
+            if "换手率" in df.columns:
+                df = df[df["换手率"] >= 5.0]
 
-            show_cols = ["代码", "名称", "最新价", "涨跌幅", "量比", "60日涨跌幅", "总市值"]
-            df_res = df[show_cols].sort_values(by=["量比", "涨跌幅"], ascending=False).reset_index(drop=True)
-            df_res["总市值"] = (df_res["总市值"] / 100000000).round(0).astype("int64").astype(str) + " 亿元"
+            show_cols = [c for c in ["代码", "名称", "最新价", "涨跌幅", "量比", "60日涨跌幅", "总市值"] if c in df.columns]
+            sort_cols = [c for c in ["量比", "涨跌幅"] if c in df.columns]
+            df_res = df[show_cols].sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
+            if "总市值" in df_res.columns:
+                df_res["总市值"] = (df_res["总市值"] / 100000000).round(0).astype("Int64").astype(str) + " 亿元"
             df_res["买入建议"] = "今日放量跟随买入/逢均线低吸"
             df_res["卖出/止损纪律"] = "收盘跌破 10日/20日均线无条件止损"
 
@@ -470,41 +607,27 @@ if st.button("🔭 启动中长线价值雷达扫描"):
             if df_spot is None or df_spot.empty:
                 raise ValueError("全市场行情接口返回为空")
 
-            required = {
-                "代码",
-                "名称",
-                "最新价",
-                "市盈率-动态",
-                "60日涨跌幅",
-                "总市值",
-                "年初至今涨跌幅",
-                "换手率",
-            }
-            missing = required - set(df_spot.columns)
-            if missing:
-                raise ValueError(f"行情缺少字段：{missing}")
-
             df = df_spot.copy()
-            df["代码"] = df["代码"].astype(str).str.replace(".0", "", regex=False).str.zfill(6)
-            df["最新价"] = pd.to_numeric(df["最新价"], errors="coerce")
-            df["市盈率-动态"] = pd.to_numeric(df["市盈率-动态"], errors="coerce")
-            df["60日涨跌幅"] = pd.to_numeric(df["60日涨跌幅"], errors="coerce")
-            df["总市值"] = pd.to_numeric(df["总市值"], errors="coerce")
-            df["年初至今涨跌幅"] = pd.to_numeric(df["年初至今涨跌幅"], errors="coerce")
-            df["换手率"] = pd.to_numeric(df["换手率"], errors="coerce")
+            df["代码"] = _normalize_code_series(df["代码"])
+            df = _to_numeric_cols(df, ["最新价", "市盈率-动态", "60日涨跌幅", "总市值", "年初至今涨跌幅", "换手率"])
 
             df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
-            df = df[(df["市盈率-动态"] >= 5) & (df["市盈率-动态"] <= 40)]
-            df = df[df["总市值"] >= 10000000000]
-            df = df[(df["60日涨跌幅"] >= 10) & (df["60日涨跌幅"] <= 40)]
-            df = df[(df["换手率"] >= 1.0) & (df["换手率"] <= 8.0)]
+            if "市盈率-动态" in df.columns:
+                df = df[(df["市盈率-动态"] >= 5) & (df["市盈率-动态"] <= 40)]
+            if "总市值" in df.columns:
+                df = df[df["总市值"] >= 10000000000]
+            if "60日涨跌幅" in df.columns:
+                df = df[(df["60日涨跌幅"] >= 10) & (df["60日涨跌幅"] <= 40)]
+            if "换手率" in df.columns:
+                df = df[(df["换手率"] >= 1.0) & (df["换手率"] <= 8.0)]
 
-            show_cols = ["代码", "名称", "最新价", "市盈率-动态", "60日涨跌幅", "总市值", "年初至今涨跌幅"]
-            df_res = (
-                df[show_cols]
-                .sort_values(by=["60日涨跌幅", "总市值"], ascending=[False, False])
-                .reset_index(drop=True)
-            )
+            show_cols = [
+                c
+                for c in ["代码", "名称", "最新价", "市盈率-动态", "60日涨跌幅", "总市值", "年初至今涨跌幅"]
+                if c in df.columns
+            ]
+            sort_cols = [c for c in ["60日涨跌幅", "总市值"] if c in df.columns]
+            df_res = df[show_cols].sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
 
             if df_res.empty:
                 st.error("当前市场无符合低估值+中线走强的稳健标的，建议等待")
