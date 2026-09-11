@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from datetime import date, datetime
 
 # 保证无论从哪里启动，都能找到同目录的 auction_picker.py
@@ -48,6 +49,23 @@ import pandas as pd
 import streamlit as st
 
 import auction_picker as picker
+
+
+def get_spot_data_with_retry(max_retries=3, delay=2):
+    """获取全市场实时行情。失败后等待再试，避免免费接口被瞬间掐断。"""
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = ak.stock_zh_a_spot_em()
+            if df is None or (hasattr(df, "empty") and df.empty):
+                raise ValueError("全市场行情接口返回为空")
+            return df
+        except Exception as exc:
+            last_error = exc
+            print(f"警告：获取全市场行情失败（第 {attempt}/{max_retries} 次）：{exc}")
+            if attempt < max_retries:
+                time.sleep(delay)
+    raise RuntimeError(f"获取全市场行情连续失败 {max_retries} 次：{last_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +336,7 @@ st.info("💡 操作指南：请在交易日下午 14:50 左右点击运行。�
 if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
     with st.spinner("WZ Breaker 正在扫描尾盘强资金抢筹标的..."):
         try:
-            df_spot = ak.stock_zh_a_spot_em()
+            df_spot = get_spot_data_with_retry()
             if df_spot is None or df_spot.empty:
                 raise ValueError("全市场行情接口返回为空")
 
@@ -379,7 +397,7 @@ st.info("💡 操作指南：盘中随时可看。专门捕捉 50-500亿盘子�
 if st.button("📡 启动趋势雷达扫描"):
     with st.spinner("WZ Breaker 正在扫描趋势中军·放量起爆标的..."):
         try:
-            df_spot = ak.stock_zh_a_spot_em()
+            df_spot = get_spot_data_with_retry()
             if df_spot is None or df_spot.empty:
                 raise ValueError("全市场行情接口返回为空")
 
@@ -448,7 +466,7 @@ st.info("💡 战略投资指南：本模块旨在挖掘【基本面优秀 + 中
 if st.button("🔭 启动中长线价值雷达扫描"):
     with st.spinner("WZ Breaker 正在扫描机构抱团·价值趋势共振标的..."):
         try:
-            df_spot = ak.stock_zh_a_spot_em()
+            df_spot = get_spot_data_with_retry()
             if df_spot is None or df_spot.empty:
                 raise ValueError("全市场行情接口返回为空")
 
