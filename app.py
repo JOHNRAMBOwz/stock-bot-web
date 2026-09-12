@@ -684,7 +684,21 @@ if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
             else:
                 st.info(f"基础筛选入围 {len(df_res)} 只，开始逐只补抓大资金与区间涨跌（每只间隔约 2 秒，防止封 IP）…")
                 df_res = _enrich_module3_advanced(df_res)
-                st.success(f"🎉 尾盘扫描完成，发现 {len(df_res)} 只符合强资金抢筹特征的标的。")
+                flow_col = "主力净流入(万)"
+                if flow_col in df_res.columns:
+                    was_na = df_res[flow_col].astype(str).eq("暂无数据")
+                    flow_num = pd.to_numeric(df_res[flow_col].replace("暂无数据", 0), errors="coerce").fillna(0).astype(float)
+                    df_res = (
+                        df_res.assign(_flow_sort=flow_num, _flow_was_na=was_na)
+                        .sort_values("_flow_sort", ascending=False)
+                        .head(10)
+                        .reset_index(drop=True)
+                    )
+                    df_res.loc[df_res["_flow_was_na"], flow_col] = "暂无数据"
+                    df_res = df_res.drop(columns=["_flow_sort", "_flow_was_na"])
+                else:
+                    df_res = df_res.head(10).reset_index(drop=True)
+                st.success("🤖 Stock-Bot 已为您自动按『主力净流入』降序排列，并精选出全市场资金抢筹最凶的前 10 大核心标的！")
                 st.dataframe(
                     df_res,
                     use_container_width=True,
