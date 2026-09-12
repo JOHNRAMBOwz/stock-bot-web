@@ -380,7 +380,12 @@ st.set_page_config(page_title="WZ Breaker - A股情绪动量模型", layout="wid
 st.sidebar.title("WZ Breaker")
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔐 VIP 用户验证")
-activation_code = st.sidebar.text_input("请输入激活码解锁核心功能", type="password")
+activation_code = st.sidebar.text_input(
+    "请输入激活码解锁核心功能",
+    type="password",
+    placeholder="输入后请按回车键，或点击下方验证",
+)
+st.sidebar.button("🔐 验证并登录")
 
 # 用户数据库：激活码 -> 到期日期
 VIP_DATABASE = {
@@ -388,16 +393,27 @@ VIP_DATABASE = {
     "test001": "2026-9-30",
 }
 
-if activation_code not in VIP_DATABASE:
-    st.warning("⚠️ 欢迎来到 WZ Breaker - A股情绪动量模型。请输入有效的 VIP 激活码以解锁选股策略。")
-    st.sidebar.error("无效激活码")
+code = (activation_code or "").strip()
+
+if not code:
+    st.sidebar.info("👆 请在上方输入激活码，并点击验证以解锁系统。")
     st.sidebar.info("购买激活码请联系管理员微信。")
     st.sidebar.markdown("**微信：azxc139210**")
+    st.warning("⚠️ 欢迎来到 WZ Breaker - A股情绪动量模型。请输入 VIP 激活码后按回车，或点击左侧「验证并登录」。")
     st.markdown("购买激活码请联系管理员微信。")
     st.markdown("**微信：azxc139210**")
     st.stop()
 
-expire_str = VIP_DATABASE[activation_code]
+if code not in VIP_DATABASE:
+    st.sidebar.error("❌ 激活码错误或不存在，请检查大小写！")
+    st.sidebar.info("购买激活码请联系管理员微信。")
+    st.sidebar.markdown("**微信：azxc139210**")
+    st.warning("⚠️ 欢迎来到 WZ Breaker - A股情绪动量模型。请输入有效的 VIP 激活码以解锁选股策略。")
+    st.markdown("购买激活码请联系管理员微信。")
+    st.markdown("**微信：azxc139210**")
+    st.stop()
+
+expire_str = VIP_DATABASE[code]
 expire_date = datetime.strptime(expire_str, "%Y-%m-%d").date()
 today = date.today()  # 等价于 datetime.date.today()
 
@@ -497,6 +513,7 @@ def _pretty_result_table(picked: pd.DataFrame) -> pd.DataFrame:
             "今日高开(%)": (pd.to_numeric(picked["高开幅度"], errors="coerce") * 100).round(2),
             "建议入场价": suggest_entry,
             "硬性止损位": hard_stop,
+            "逻辑止盈纪律": "T+1卖出：次日不封死涨停，或冲高跌破分时黄线(均价线)，无条件止盈出局",
         }
     )
     if "所属行业" in picked.columns:
@@ -609,6 +626,7 @@ if st.button("🔫 启动 9:25 终极选股策略"):
                             "今日高开(%)": st.column_config.NumberColumn("今日高开(%)", format="%+.2f"),
                             "建议入场价": st.column_config.NumberColumn("建议入场价", format="%.2f"),
                             "硬性止损位": st.column_config.NumberColumn("硬性止损位", format="%.2f"),
+                            "逻辑止盈纪律": st.column_config.TextColumn("逻辑止盈纪律", width="large"),
                         },
                     )
 
@@ -712,9 +730,32 @@ if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
                 )
                 st.caption("以上仅为数据筛选，不构成任何投资建议。股市有风险，入市需谨慎。")
 
-        except Exception as e:
-            st.error(f"运行报错：{e}")
-            st.error("请检查网络是否正常。建议在交易日 14:50 左右、行情接口可用时再扫一次。")
+                st.markdown("### 🎯 核心标的次日操盘计划 (执行表)")
+                last_px = pd.to_numeric(df_res["最新价"], errors="coerce")
+                df_plan = pd.DataFrame(
+                    {
+                        "代码": df_res["代码"],
+                        "名称": df_res["名称"],
+                        "建议入场价": last_px.astype(float).round(2),
+                        "明日冲板阻力位": (last_px * 1.095).astype(float).round(2),
+                        "硬性防守线(-3.5%)": (last_px * 0.965).astype(float).round(2),
+                        "逻辑止盈纪律": "动态止盈：急拉不板遇阻卖；若平/低开，盯死分时黄线(即分时图上的均价线)，站稳格局，破位出局",
+                    }
+                )
+                st.dataframe(
+                    df_plan,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "代码": st.column_config.TextColumn("代码", width="small"),
+                        "名称": st.column_config.TextColumn("名称", width="small"),
+                        "建议入场价": st.column_config.NumberColumn("建议入场价", format="%.2f"),
+                        "明日冲板阻力位": st.column_config.NumberColumn("明日冲板阻力位", format="%.2f"),
+                        "硬性防守线(-3.5%)": st.column_config.NumberColumn("硬性防守线(-3.5%)", format="%.2f"),
+                        "逻辑止盈纪律": st.column_config.TextColumn("逻辑止盈纪律", width="large"),
+                    },
+                )
+                st.caption("注：尾盘潜伏博弈的是次日早盘溢价，无论盈亏，次日早盘10:00前建议了结，绝不恋战。")
 
 st.markdown("---")
 
