@@ -82,6 +82,9 @@ def _normalize_tencent_spot(raw: pd.DataFrame) -> pd.DataFrame:
         "volume": "成交量",
         "turnover": "成交额",
         "zf": "振幅",
+        "zljlr": "主力净流入_快照",
+        "zllr_d5": "主力流入_五日",
+        "zllc_d5": "主力流出_五日",
     }
     df = raw.rename(columns={k: v for k, v in rename_map.items() if k in raw.columns}).copy()
     if "代码" not in df.columns:
@@ -103,10 +106,15 @@ def _normalize_tencent_spot(raw: pd.DataFrame) -> pd.DataFrame:
             "成交量",
             "成交额",
             "振幅",
+            "主力净流入_快照",
+            "主力流入_五日",
+            "主力流出_五日",
         ],
     )
     if "总市值_亿元" in df.columns:
         df["总市值"] = df["总市值_亿元"] * 100000000
+    if "主力流入_五日" in df.columns and "主力流出_五日" in df.columns:
+        df["五日主力净流入"] = df["主力流入_五日"] - df["主力流出_五日"]
     return df
 
 
@@ -218,6 +226,24 @@ def _market_of_code(code: str) -> str:
     return "sz"
 
 
+def _prefixed_symbol(code: str) -> tuple[str, str]:
+    """返回 (纯数字代码, 带 sh/sz/bj 前缀的代码)。"""
+    raw = str(code).replace(".0", "").strip()
+    raw = raw.lower()
+    for pfx in ("sh", "sz", "bj"):
+        if raw.startswith(pfx):
+            raw = raw[len(pfx) :]
+            break
+    raw = raw.zfill(6)
+    if raw.startswith("6"):
+        return raw, "sh" + raw
+    if raw.startswith(("0", "3")):
+        return raw, "sz" + raw
+    if raw.startswith(("4", "8")):
+        return raw, "bj" + raw
+    return raw, "sz" + raw
+
+
 def _amount_to_yi(series: pd.Series) -> pd.Series:
     """把成交额统一成亿元。腾讯多为万元，新浪多为元。"""
     amt = pd.to_numeric(series, errors="coerce")
@@ -229,51 +255,90 @@ def _amount_to_yi(series: pd.Series) -> pd.Series:
     return (amt / 10000).round(2)
 
 
-def _fetch_main_net_inflow(code: str, days: int = 1):
+def _close_series(hist: pd.DataFrame) -> pd.Series:
+    if hist is None or hist.empty:
+        return pd.Series(dtype=float)
+    col = "收盘" if "收盘" in hist.columns else ("close" if "close" in hist.columns else None)
+    if col is None:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(hist[col], errors="coerce").dropna()
+
+
+def _calc_range_pct(close: pd.Series):
+    if close is None or len(close) < 2:
+        return "暂无数据", "暂无数据"
+    last = float(close.iloc[-1])
+    d5 = "暂无数据"
+    d20 = "暂无数据"
+    if len(close) >= 6 and float(close.iloc[-6]) > 0:
+        d5 = round((last / float(close.iloc[-6]) - 1) * 100, 2)
+    if len(close) >= 21 and float(close.iloc[-21]) > 0:
+        d20 = round((last / float(close.iloc[-21]) - 1) * 100, 2)
+    return d5, d20
+
+
+def _fetch_main_net_inflow(code: str, symbol: str = "", days: int = 1, snapshot_row=None):
     """个股主力净流入，单位万元。days=1 取今日，days=5 取近五日合计。失败返回暂无数据。"""
+    raw, prefixed = _prefixed_symbol(symbol or code)
+    market = prefixed[:2]
     try:
-        flow = ak.stock_individual_fund_flow(stock=str(code).zfill(6), market=_market_of_code(code))
+        flow = ak.stock_individual_fund_flow(stock=raw, market=market)
         if flow is None or flow.empty or "主力净流入-净额" not in flow.columns:
-            return "暂无数据"
+            raise ValueError("资金流接口返回空表")
         if "日期" in flow.columns:
             flow = flow.sort_values("日期")
         vals = pd.to_numeric(flow["主力净流入-净额"], errors="coerce").dropna()
         if vals.empty:
-            return "暂无数据"
+            raise ValueError("主力净流入-净额为空")
         take = max(int(days), 1)
         val = float(vals.iloc[-1] if take == 1 else vals.tail(take).sum())
         return round(val / 10000.0, 2)
-    except Exception:
-        return "暂无数据"
+    except Exception as e:
+        print(f"{raw} 抓取失败: {e}")
+
+    if snapshot_row is not None:
+        snap_col = "五日主力净流入" if days >= 5 else "主力净流入_快照"
+        if snap_col in snapshot_row.index:
+            snap = pd.to_numeric(pd.Series([snapshot_row[snap_col]]), errors="coerce").iloc[0]
+            if pd.notna(snap):
+                print(f"{raw} 资金流改用腾讯快照字段 {snap_col}={snap}")
+                return round(float(snap), 2)
+    return "暂无数据"
 
 
-def _fetch_range_pct(code: str):
-    """近5日、近20日区间涨跌幅（%）。失败返回暂无数据。"""
+def _fetch_range_pct(code: str, symbol: str = ""):
+    """近5日、近20日区间涨跌幅（%）。东方财富失败时改走腾讯/新浪。"""
+    raw, prefixed = _prefixed_symbol(symbol or code)
+    end = datetime.now().strftime("%Y%m%d")
+    start = (datetime.now() - timedelta(days=70)).strftime("%Y%m%d")
+
     try:
-        end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=70)).strftime("%Y%m%d")
-        hist = ak.stock_zh_a_hist(
-            symbol=str(code).zfill(6),
-            period="daily",
-            start_date=start,
-            end_date=end,
-            adjust="qfq",
-        )
-        if hist is None or hist.empty or "收盘" not in hist.columns:
-            return "暂无数据", "暂无数据"
-        close = pd.to_numeric(hist["收盘"], errors="coerce").dropna()
-        if len(close) < 2:
-            return "暂无数据", "暂无数据"
-        last = float(close.iloc[-1])
-        d5 = "暂无数据"
-        d20 = "暂无数据"
-        if len(close) >= 6 and float(close.iloc[-6]) > 0:
-            d5 = round((last / float(close.iloc[-6]) - 1) * 100, 2)
-        if len(close) >= 21 and float(close.iloc[-21]) > 0:
-            d20 = round((last / float(close.iloc[-21]) - 1) * 100, 2)
-        return d5, d20
-    except Exception:
-        return "暂无数据", "暂无数据"
+        hist = ak.stock_zh_a_hist(symbol=raw, period="daily", start_date=start, end_date=end, adjust="qfq")
+        close = _close_series(hist)
+        if len(close) >= 2:
+            return _calc_range_pct(close)
+        raise ValueError("K线为空或收盘价不足")
+    except Exception as e:
+        print(f"{raw} 抓取失败: {e}")
+
+    try:
+        hist = ak.stock_zh_a_hist_tx(symbol=prefixed, start_date=start, end_date=end, adjust="qfq")
+        close = _close_series(hist)
+        if len(close) >= 2:
+            return _calc_range_pct(close)
+        raise ValueError("腾讯K线为空")
+    except Exception as e:
+        print(f"{raw} 抓取失败: {e}")
+
+    try:
+        hist = ak.stock_zh_a_daily(symbol=prefixed, start_date=start, end_date=end, adjust="qfq")
+        close = _close_series(hist)
+        if len(close) >= 2:
+            return _calc_range_pct(close)
+        raise ValueError("新浪K线为空")
+    except Exception as e:
+        print(f"{raw} 抓取失败: {e}")
+    return "暂无数据", "暂无数据"
 
 
 def _enrich_module3_advanced(df_res: pd.DataFrame, flow_days: int = 1) -> pd.DataFrame:
@@ -285,13 +350,14 @@ def _enrich_module3_advanced(df_res: pd.DataFrame, flow_days: int = 1) -> pd.Dat
     flows, pct5s, pct20s = [], [], []
 
     for i, row in out.iterrows():
-        code = str(row["代码"]).zfill(6)
+        code, symbol = _prefixed_symbol(row["代码"])
         name = str(row.get("名称", code))
-        status.caption(f"二次抓取 {i + 1}/{n}：{name}（{code}）资金流与区间涨跌")
+        status.caption(f"二次抓取 {i + 1}/{n}：{name}（{symbol}）资金流与区间涨跌")
+        print(f"二次抓取 {code} / {symbol}")
 
-        flows.append(_fetch_main_net_inflow(code, days=flow_days))
+        flows.append(_fetch_main_net_inflow(code, symbol=symbol, days=flow_days, snapshot_row=row))
         time.sleep(1)
-        d5, d20 = _fetch_range_pct(code)
+        d5, d20 = _fetch_range_pct(code, symbol=symbol)
         pct5s.append(d5)
         pct20s.append(d20)
         time.sleep(1)
@@ -300,6 +366,7 @@ def _enrich_module3_advanced(df_res: pd.DataFrame, flow_days: int = 1) -> pd.Dat
     out["主力净流入(万)"] = flows
     out["近5日涨跌幅(%)"] = pct5s
     out["近20日涨跌幅(%)"] = pct20s
+    out = out.drop(columns=[c for c in ["主力净流入_快照", "五日主力净流入"] if c in out.columns], errors="ignore")
     progress.empty()
     status.empty()
     return out
@@ -596,7 +663,17 @@ if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
 
             show_cols = [
                 c
-                for c in ["代码", "名称", "最新价", "涨跌幅", "换手率", "最高", "成交额(亿)"]
+                for c in [
+                    "代码",
+                    "名称",
+                    "最新价",
+                    "涨跌幅",
+                    "换手率",
+                    "最高",
+                    "成交额(亿)",
+                    "主力净流入_快照",
+                    "五日主力净流入",
+                ]
                 if c in df.columns
             ]
             sort_cols = [c for c in ["涨跌幅", "换手率"] if c in df.columns]
@@ -672,7 +749,18 @@ if st.button("📡 启动趋势雷达扫描"):
 
             show_cols = [
                 c
-                for c in ["代码", "名称", "最新价", "涨跌幅", "量比", "60日涨跌幅", "总市值", "成交额(亿)"]
+                for c in [
+                    "代码",
+                    "名称",
+                    "最新价",
+                    "涨跌幅",
+                    "量比",
+                    "60日涨跌幅",
+                    "总市值",
+                    "成交额(亿)",
+                    "主力净流入_快照",
+                    "五日主力净流入",
+                ]
                 if c in df.columns
             ]
             sort_cols = [c for c in ["量比", "涨跌幅"] if c in df.columns]
