@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 # 保证无论从哪里启动，都能找到同目录的 auction_picker.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -207,6 +207,102 @@ def get_spot_data_with_retry(max_retries=3, delay=2, need_ohlc=False) -> pd.Data
     if sina_df is not None:
         return _fill_derived_prices(sina_df)
     raise RuntimeError("腾讯与新浪全市场行情均失败：{}".format("；".join(errors)))
+
+
+def _market_of_code(code: str) -> str:
+    code = str(code).zfill(6)
+    if code.startswith("6"):
+        return "sh"
+    if code.startswith(("4", "8")):
+        return "bj"
+    return "sz"
+
+
+def _amount_to_yi(series: pd.Series) -> pd.Series:
+    """把成交额统一成亿元。腾讯多为万元，新浪多为元。"""
+    amt = pd.to_numeric(series, errors="coerce")
+    med = amt.median()
+    if pd.isna(med):
+        return amt
+    if med > 1e7:
+        return (amt / 100000000).round(2)
+    return (amt / 10000).round(2)
+
+
+def _fetch_main_net_inflow(code: str, days: int = 1):
+    """个股主力净流入，单位万元。days=1 取今日，days=5 取近五日合计。失败返回暂无数据。"""
+    try:
+        flow = ak.stock_individual_fund_flow(stock=str(code).zfill(6), market=_market_of_code(code))
+        if flow is None or flow.empty or "主力净流入-净额" not in flow.columns:
+            return "暂无数据"
+        if "日期" in flow.columns:
+            flow = flow.sort_values("日期")
+        vals = pd.to_numeric(flow["主力净流入-净额"], errors="coerce").dropna()
+        if vals.empty:
+            return "暂无数据"
+        take = max(int(days), 1)
+        val = float(vals.iloc[-1] if take == 1 else vals.tail(take).sum())
+        return round(val / 10000.0, 2)
+    except Exception:
+        return "暂无数据"
+
+
+def _fetch_range_pct(code: str):
+    """近5日、近20日区间涨跌幅（%）。失败返回暂无数据。"""
+    try:
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=70)).strftime("%Y%m%d")
+        hist = ak.stock_zh_a_hist(
+            symbol=str(code).zfill(6),
+            period="daily",
+            start_date=start,
+            end_date=end,
+            adjust="qfq",
+        )
+        if hist is None or hist.empty or "收盘" not in hist.columns:
+            return "暂无数据", "暂无数据"
+        close = pd.to_numeric(hist["收盘"], errors="coerce").dropna()
+        if len(close) < 2:
+            return "暂无数据", "暂无数据"
+        last = float(close.iloc[-1])
+        d5 = "暂无数据"
+        d20 = "暂无数据"
+        if len(close) >= 6 and float(close.iloc[-6]) > 0:
+            d5 = round((last / float(close.iloc[-6]) - 1) * 100, 2)
+        if len(close) >= 21 and float(close.iloc[-21]) > 0:
+            d20 = round((last / float(close.iloc[-21]) - 1) * 100, 2)
+        return d5, d20
+    except Exception:
+        return "暂无数据", "暂无数据"
+
+
+def _enrich_module3_advanced(df_res: pd.DataFrame, flow_days: int = 1) -> pd.DataFrame:
+    """只对入围标的逐只补资金流和区间涨跌，中间休眠，避免封 IP。"""
+    out = df_res.copy()
+    n = len(out)
+    progress = st.progress(0, text="正在对入围标的做二次高级数据抓取…")
+    status = st.empty()
+    flows, pct5s, pct20s = [], [], []
+
+    for i, row in out.iterrows():
+        code = str(row["代码"]).zfill(6)
+        name = str(row.get("名称", code))
+        status.caption(f"二次抓取 {i + 1}/{n}：{name}（{code}）资金流与区间涨跌")
+
+        flows.append(_fetch_main_net_inflow(code, days=flow_days))
+        time.sleep(1)
+        d5, d20 = _fetch_range_pct(code)
+        pct5s.append(d5)
+        pct20s.append(d20)
+        time.sleep(1)
+        progress.progress((i + 1) / n, text=f"二次抓取进度 {i + 1}/{n}")
+
+    out["主力净流入(万)"] = flows
+    out["近5日涨跌幅(%)"] = pct5s
+    out["近20日涨跌幅(%)"] = pct20s
+    progress.empty()
+    status.empty()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -495,13 +591,22 @@ if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
                 df = df[df["最高"] > 0]
                 df = df[df["最新价"] >= df["最高"] * 0.985]
 
-            show_cols = [c for c in ["代码", "名称", "最新价", "涨跌幅", "换手率", "最高"] if c in df.columns]
+            if "成交额" in df.columns:
+                df["成交额(亿)"] = _amount_to_yi(df["成交额"])
+
+            show_cols = [
+                c
+                for c in ["代码", "名称", "最新价", "涨跌幅", "换手率", "最高", "成交额(亿)"]
+                if c in df.columns
+            ]
             sort_cols = [c for c in ["涨跌幅", "换手率"] if c in df.columns]
             df_res = df[show_cols].sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
 
             if df_res.empty:
                 st.error("今日尾盘无符合强资金抢筹特征的标的，管住手")
             else:
+                st.info(f"基础筛选入围 {len(df_res)} 只，开始逐只补抓大资金与区间涨跌（每只间隔约 2 秒，防止封 IP）…")
+                df_res = _enrich_module3_advanced(df_res)
                 st.success(f"🎉 尾盘扫描完成，发现 {len(df_res)} 只符合强资金抢筹特征的标的。")
                 st.dataframe(
                     df_res,
@@ -514,6 +619,10 @@ if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
                         "涨跌幅": st.column_config.NumberColumn("涨跌幅", format="%+.2f"),
                         "换手率": st.column_config.NumberColumn("换手率", format="%.2f"),
                         "最高": st.column_config.NumberColumn("最高", format="%.2f"),
+                        "成交额(亿)": st.column_config.NumberColumn("成交额(亿)", format="%.2f"),
+                        "主力净流入(万)": st.column_config.TextColumn("主力净流入(万)"),
+                        "近5日涨跌幅(%)": st.column_config.TextColumn("近5日涨跌幅(%)"),
+                        "近20日涨跌幅(%)": st.column_config.TextColumn("近20日涨跌幅(%)"),
                     },
                 )
                 st.caption("以上仅为数据筛选，不构成任何投资建议。股市有风险，入市需谨慎。")
@@ -558,9 +667,18 @@ if st.button("📡 启动趋势雷达扫描"):
             if "换手率" in df.columns:
                 df = df[df["换手率"] >= 5.0]
 
-            show_cols = [c for c in ["代码", "名称", "最新价", "涨跌幅", "量比", "60日涨跌幅", "总市值"] if c in df.columns]
+            if "成交额" in df.columns:
+                df["成交额(亿)"] = _amount_to_yi(df["成交额"])
+
+            show_cols = [
+                c
+                for c in ["代码", "名称", "最新价", "涨跌幅", "量比", "60日涨跌幅", "总市值", "成交额(亿)"]
+                if c in df.columns
+            ]
             sort_cols = [c for c in ["量比", "涨跌幅"] if c in df.columns]
             df_res = df[show_cols].sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
+            if "成交额(亿)" not in df_res.columns:
+                df_res["成交额(亿)"] = "暂无数据"
             if "总市值" in df_res.columns:
                 df_res["总市值"] = (df_res["总市值"] / 100000000).round(0).astype("Int64").astype(str) + " 亿元"
             df_res["买入建议"] = "今日放量跟随买入/逢均线低吸"
@@ -569,6 +687,8 @@ if st.button("📡 启动趋势雷达扫描"):
             if df_res.empty:
                 st.error("今日无符合趋势中军·放量起爆特征的标的，管住手")
             else:
+                st.info(f"基础筛选入围 {len(df_res)} 只，开始逐只补抓近五日资金流与区间涨跌（每只间隔约 2 秒，防止封 IP）…")
+                df_res = _enrich_module3_advanced(df_res, flow_days=5)
                 st.success(f"🎉 趋势雷达扫描完成，发现 {len(df_res)} 只趋势核心龙。")
                 st.dataframe(
                     df_res,
@@ -582,6 +702,10 @@ if st.button("📡 启动趋势雷达扫描"):
                         "量比": st.column_config.NumberColumn("量比", format="%.2f"),
                         "60日涨跌幅": st.column_config.NumberColumn("60日涨跌幅", format="%+.2f"),
                         "总市值": st.column_config.TextColumn("总市值", width="small"),
+                        "成交额(亿)": st.column_config.NumberColumn("成交额(亿)", format="%.2f"),
+                        "主力净流入(万)": st.column_config.TextColumn("主力净流入(万)"),
+                        "近5日涨跌幅(%)": st.column_config.TextColumn("近5日涨跌幅(%)"),
+                        "近20日涨跌幅(%)": st.column_config.TextColumn("近20日涨跌幅(%)"),
                         "买入建议": st.column_config.TextColumn("买入建议", width="medium"),
                         "卖出/止损纪律": st.column_config.TextColumn("卖出/止损纪律", width="large"),
                     },
