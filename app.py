@@ -679,6 +679,7 @@ if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
             if "成交额" in df.columns:
                 df["成交额(亿)"] = _amount_to_yi(df["成交额"])
 
+            n_basic = len(df)
             show_cols = [
                 c
                 for c in [
@@ -694,13 +695,17 @@ if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
                 ]
                 if c in df.columns
             ]
-            sort_cols = [c for c in ["涨跌幅", "换手率"] if c in df.columns]
-            df_res = df[show_cols].sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
+            if "换手率" in df.columns:
+                df_res = df[show_cols].sort_values(by="换手率", ascending=False).head(20).reset_index(drop=True)
+            else:
+                df_res = df[show_cols].head(20).reset_index(drop=True)
 
             if df_res.empty:
                 st.error("今日尾盘无符合强资金抢筹特征的标的，管住手")
             else:
-                st.info(f"基础筛选入围 {len(df_res)} 只，开始逐只补抓大资金与区间涨跌（每只间隔约 2 秒，防止封 IP）…")
+                st.write(
+                    f"基础筛选入围 {n_basic} 只，截取换手率最高的前 20 只进行深度资金分析 (预计耗时20秒)..."
+                )
                 df_res = _enrich_module3_advanced(df_res)
                 if "主力净流入(万)" in df_res.columns:
                     df_res = df_res.copy()
