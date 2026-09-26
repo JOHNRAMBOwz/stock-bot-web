@@ -13,12 +13,110 @@ WZ Breaker - A股情绪动量模型 · Streamlit 网页前端
 from __future__ import annotations
 
 import os
+import random
 import sys
 import time
 from datetime import date, datetime, timedelta
 
 # 保证无论从哪里启动，都能找到同目录的 auction_picker.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+# ---------------------------------------------------------------------------
+# 东方财富底层请求防护：随机 UA + 分页/重试随机休眠，降低 502 限流
+# ---------------------------------------------------------------------------
+_EM_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
+_last_em_request_ts = 0.0
+
+
+def _random_em_headers() -> dict:
+    return {
+        "User-Agent": random.choice(_EM_USER_AGENTS),
+        "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
+    }
+
+
+def _em_jitter_sleep() -> None:
+    time.sleep(random.uniform(0.5, 1.0))
+
+
+def _install_eastmoney_request_shield() -> None:
+    """给所有东方财富请求加上随机浏览器头，并在相邻请求之间随机停 0.5~1 秒。"""
+    import requests
+    from requests.adapters import HTTPAdapter
+
+    global _last_em_request_ts
+
+    if getattr(requests.Session.request, "_em_shield_installed", False):
+        return
+
+    original_request = requests.Session.request
+
+    def shielded_request(self, method, url, *args, **kwargs):
+        global _last_em_request_ts
+        if "eastmoney.com" in str(url).lower():
+            headers = dict(kwargs.get("headers") or {})
+            headers.update(_random_em_headers())
+            kwargs["headers"] = headers
+            if _last_em_request_ts > 0:
+                _em_jitter_sleep()
+            _last_em_request_ts = time.time()
+        return original_request(self, method, url, *args, **kwargs)
+
+    shielded_request._em_shield_installed = True
+    requests.Session.request = shielded_request
+
+    try:
+        import akshare.utils.func as ak_func
+        import akshare.utils.request as ak_req
+    except Exception:
+        return
+
+    def shielded_request_with_retry(
+        url,
+        params=None,
+        timeout=15,
+        max_retries=3,
+        base_delay=1.0,
+        random_delay_range=(0.5, 1.0),
+    ):
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0.5, 1.0)
+                    time.sleep(delay)
+                with requests.Session() as session:
+                    adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1)
+                    session.mount("http://", adapter)
+                    session.mount("https://", adapter)
+                    response = session.get(
+                        url,
+                        params=params,
+                        timeout=timeout,
+                        headers=_random_em_headers(),
+                    )
+                    response.raise_for_status()
+                    return response
+            except Exception as exc:
+                last_exception = exc
+        raise last_exception
+
+    shielded_request_with_retry._em_shield_installed = True
+    ak_req.request_with_retry = shielded_request_with_retry
+    ak_func.request_with_retry = shielded_request_with_retry
 
 
 def _ensure_streamlit() -> None:
@@ -47,6 +145,8 @@ _ensure_streamlit()
 import akshare as ak
 import pandas as pd
 import streamlit as st
+
+_install_eastmoney_request_shield()
 
 import auction_picker as picker
 
