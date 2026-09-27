@@ -16,7 +16,7 @@ import os
 import random
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 # 保证无论从哪里启动，都能找到同目录的 auction_picker.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -269,6 +269,19 @@ def _try_fetch_spot(fetcher, desc: str, max_retries: int, delay: float):
             if attempt < max_retries:
                 time.sleep(delay)
     raise RuntimeError(f"{desc}连续失败 {max_retries} 次：{last_error}")
+
+
+def _beijing_now() -> datetime:
+    return datetime.now(timezone(timedelta(hours=8)))
+
+
+def _stop_if_weekend() -> None:
+    """周末休市时不打实时快照，避免东方财富 502。"""
+    if _beijing_now().weekday() >= 5:
+        st.warning(
+            "☕ 提示：今天是周末非交易日，A股休市，实时快照数据源可能处于维护状态。请在工作日测试该功能。"
+        )
+        st.stop()
 
 
 def get_spot_data_with_retry(max_retries=3, delay=2, need_ohlc=False) -> pd.DataFrame:
@@ -626,6 +639,7 @@ def _pretty_result_table(picked: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 st.header("📊 模块一：全局情绪温度计")
 if st.button("🔄 点击获取今日最新情绪数据"):
+    _stop_if_weekend()
     with st.spinner("WZ Breaker 正在高速连接交易所服务器..."):
         try:
             today_str = datetime.now().strftime("%Y%m%d")
@@ -682,6 +696,7 @@ st.caption(
 )
 
 if st.button("🔫 启动 9:25 终极选股策略"):
+    _stop_if_weekend()
     log_box = st.expander("📡 实时抓取日志（含今开价异常重试）", expanded=True)
     log_placeholder = log_box.empty()
     _bind_picker_logs(log_placeholder)
@@ -756,6 +771,7 @@ st.header("🌅 模块三：14:50 尾盘潜伏系统")
 st.info("💡 操作指南：请在交易日下午 14:50 左右点击运行。尾盘买入，次日早盘冲高即卖，规避 T+1 日内波动风险。")
 
 if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
+    _stop_if_weekend()
     with st.spinner("WZ Breaker 正在扫描尾盘强资金抢筹标的..."):
         try:
             df_spot = get_spot_data_with_retry(need_ohlc=True)
@@ -875,6 +891,7 @@ st.header("📈 模块四：趋势中军·放量起爆雷达")
 st.info("💡 操作指南：盘中随时可看。专门捕捉 50-500亿盘子、处于中期上升通道、今日突然放量突破的『趋势核心龙』。适合中线波段持有。")
 
 if st.button("📡 启动趋势雷达扫描"):
+    _stop_if_weekend()
     with st.spinner("WZ Breaker 正在扫描趋势中军·放量起爆标的..."):
         try:
             df_spot = get_spot_data_with_retry()
@@ -971,6 +988,7 @@ st.header("🗓️ 模块五：1-2月期『机构抱团』价值趋势共振")
 st.info("💡 战略投资指南：本模块旨在挖掘【基本面优秀 + 中大市值 + 处于温和上升通道】的机构重仓股。按 1~2 个月周期布局，做时间的朋友，告别盯盘焦虑。")
 
 if st.button("🔭 启动中长线价值雷达扫描"):
+    _stop_if_weekend()
     with st.spinner("WZ Breaker 正在扫描机构抱团·价值趋势共振标的..."):
         try:
             df_spot = get_spot_data_with_retry()
