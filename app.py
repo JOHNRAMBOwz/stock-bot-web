@@ -695,7 +695,7 @@ st.header("⚡ 模块二：9:25 集合竞价『弱转强』狙击")
 st.info("💡 操作指南：请在交易日早上 9:25 分 05秒 之后点击下方按钮，抓取竞价抢筹龙头。系统会自动重试今开价，直到行情刷新。")
 
 st.caption(
-    "策略条件：昨日涨停 · 换手 10%~30% · 剔除 ST/科创/创业/北交所 · 今日高开 3%~9%（全市场一次快照，失败自动指数退避重试）"
+    "策略条件：昨日涨停 · 昨日换手 5%~15% · 剔除 ST/科创/创业/北交所 · 今日高开 4%~7%（砍掉高开 7% 以上和换手过热标的）"
 )
 
 if st.button("🔫 启动 9:25 终极选股策略"):
@@ -714,9 +714,14 @@ if st.button("🔫 启动 9:25 终极选股策略"):
                 zt_df = picker.fetch_yesterday_limit_up(date_str)
                 st.write(f"🔥 昨日涨停股一共 **{len(zt_df)}** 只。")
 
+                # 回测风控：昨日换手只留 5%~15%，高开只留 4%~7%
+                picker.TURNOVER_MIN = 5.0
+                picker.TURNOVER_MAX = 15.0
+                picker.GAP_MIN = 0.039
+                picker.GAP_MAX = 0.071
                 candidates = picker.filter_yesterday_candidates(zt_df)
                 if candidates.empty:
-                    st.warning("昨日无符合换手率条件的股票，今日空仓。")
+                    st.warning("昨日无换手率落在 5%~15% 的涨停股，今日空仓。")
                 else:
                     preview = "、".join(
                         f"{r['名称']}({r['代码']})" for _, r in candidates.head(12).iterrows()
@@ -726,9 +731,14 @@ if st.button("🔫 启动 9:25 终极选股策略"):
                     # 核心：模块二仍走东方财富全市场快照（该接口对竞价时段可用）
                     spot = picker.fetch_today_spot()
                     picked = picker.match_weak_to_strong(candidates, spot)
+                    if picked is not None and not picked.empty:
+                        turn = pd.to_numeric(picked["换手率"], errors="coerce")
+                        gap = pd.to_numeric(picked["高开幅度"], errors="coerce")
+                        picked = picked[(turn >= 5.0) & (turn <= 15.0) & (gap >= 0.04) & (gap <= 0.07)]
+                        picked = picked.reset_index(drop=True)
 
                     if picked is None or picked.empty:
-                        st.error("😭 竞价结束，未发现符合 3%-9% 高开条件的股票。执行纪律：管住手！")
+                        st.error("😭 竞价结束，未发现符合高开 4%-7%、昨日换手 5%-15% 的股票。执行纪律：管住手！")
                     else:
                         st.success(f"🎉 狙击成功！WZ Breaker 发现 {len(picked)} 只符合黄金买点的标的！")
                         df_res = _pretty_result_table(picked)
@@ -773,6 +783,7 @@ st.markdown("---")
 # 模块三：14:50 尾盘潜伏 —— 规避 T+1 日内波动
 # ---------------------------------------------------------------------------
 st.header("🌅 模块三：14:50 尾盘潜伏系统")
+st.warning("⚠️ 尾盘策略在单边阴跌的熊市中极易失效（次日普遍低开），请结合大盘 5 日均线环境谨慎使用。")
 st.info("💡 操作指南：请在交易日下午 14:50 左右点击运行。尾盘买入，次日早盘冲高即卖，规避 T+1 日内波动风险。")
 
 if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
@@ -792,7 +803,9 @@ if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
                 df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
                 df = df[~df["代码"].str.startswith("688")]
                 df = df[~df["代码"].str.startswith("300")]
-                df = df[(df["涨跌幅"] >= 3.0) & (df["涨跌幅"] <= 7.0)]
+                df = df[~df["代码"].str.startswith("301")]
+                df = df[(df["涨跌幅"] >= 3.0) & (df["涨跌幅"] <= 5.0)]
+                df = df[(df["最新价"] < 8) | (df["最新价"] > 15)]
                 if "换手率" in df.columns:
                     df = df[df["换手率"] >= 5.0]
                 if "最高" in df.columns:
