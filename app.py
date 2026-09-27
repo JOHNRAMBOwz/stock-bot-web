@@ -275,13 +275,14 @@ def _beijing_now() -> datetime:
     return datetime.now(timezone(timedelta(hours=8)))
 
 
-def _stop_if_weekend() -> None:
-    """周末休市时不打实时快照，避免东方财富 502。"""
+def _block_if_weekend() -> bool:
+    """周末只提示并跳过本次抓取，不中断后面模块的渲染。"""
     if _beijing_now().weekday() >= 5:
         st.warning(
             "☕ 提示：今天是周末非交易日，A股休市，实时快照数据源可能处于维护状态。请在工作日测试该功能。"
         )
-        st.stop()
+        return True
+    return False
 
 
 def get_spot_data_with_retry(max_retries=3, delay=2, need_ohlc=False) -> pd.DataFrame:
@@ -639,48 +640,50 @@ def _pretty_result_table(picked: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 st.header("📊 模块一：全局情绪温度计")
 if st.button("🔄 点击获取今日最新情绪数据"):
-    _stop_if_weekend()
-    with st.spinner("WZ Breaker 正在高速连接交易所服务器..."):
-        try:
-            today_str = datetime.now().strftime("%Y%m%d")
-            used_date = today_str
+    if _block_if_weekend():
+        pass
+    else:
+        with st.spinner("WZ Breaker 正在高速连接交易所服务器..."):
             try:
-                df_zt = ak.stock_zt_pool_em(date=today_str)
-                if df_zt is None or df_zt.empty:
-                    raise ValueError("今日涨停池暂无数据")
-            except Exception:
-                used_date, _ = picker.get_previous_trade_date()
-                df_zt = ak.stock_zt_pool_em(date=used_date)
+                today_str = datetime.now().strftime("%Y%m%d")
+                used_date = today_str
+                try:
+                    df_zt = ak.stock_zt_pool_em(date=today_str)
+                    if df_zt is None or df_zt.empty:
+                        raise ValueError("今日涨停池暂无数据")
+                except Exception:
+                    used_date, _ = picker.get_previous_trade_date()
+                    df_zt = ak.stock_zt_pool_em(date=used_date)
 
-            try:
-                df_dt = ak.stock_zt_pool_dtgc_em(date=used_date)
-                if df_dt is None:
+                try:
+                    df_dt = ak.stock_zt_pool_dtgc_em(date=used_date)
+                    if df_dt is None:
+                        df_dt = pd.DataFrame()
+                except Exception:
                     df_dt = pd.DataFrame()
-            except Exception:
-                df_dt = pd.DataFrame()
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric("🔥 今日涨停家数", f"{len(df_zt)} 家", "赚钱效应")
-            if df_dt.empty:
-                col2.metric("🧊 今日跌停家数", "0 家", "亏钱效应")
-            else:
-                col2.metric("🧊 今日跌停家数", f"{len(df_dt)} 家", "-亏钱效应")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("🔥 今日涨停家数", f"{len(df_zt)} 家", "赚钱效应")
+                if df_dt.empty:
+                    col2.metric("🧊 今日跌停家数", "0 家", "亏钱效应")
+                else:
+                    col2.metric("🧊 今日跌停家数", f"{len(df_dt)} 家", "-亏钱效应")
 
-            if not df_zt.empty and "连板数" in df_zt.columns:
-                max_lb = df_zt["连板数"].max()
-                col3.metric("🚀 市场最高连板 (天花板)", f"{max_lb} 板", "情绪高度")
+                if not df_zt.empty and "连板数" in df_zt.columns:
+                    max_lb = df_zt["连板数"].max()
+                    col3.metric("🚀 市场最高连板 (天花板)", f"{max_lb} 板", "情绪高度")
 
-                st.caption(f"数据日期：{used_date}")
-                st.subheader("🏆 核心连板梯队 (只显示2连板及以上)")
-                df_lb = df_zt[df_zt["连板数"] >= 2].sort_values(by="连板数", ascending=False)
-                show_cols = [c for c in ["代码", "名称", "最新价", "涨跌幅", "连板数", "所属行业"] if c in df_lb.columns]
-                st.dataframe(df_lb[show_cols], use_container_width=True, hide_index=True)
-            else:
-                st.caption(f"数据日期：{used_date}")
-                st.info("今日涨停池暂无连板数据。")
+                    st.caption(f"数据日期：{used_date}")
+                    st.subheader("🏆 核心连板梯队 (只显示2连板及以上)")
+                    df_lb = df_zt[df_zt["连板数"] >= 2].sort_values(by="连板数", ascending=False)
+                    show_cols = [c for c in ["代码", "名称", "最新价", "涨跌幅", "连板数", "所属行业"] if c in df_lb.columns]
+                    st.dataframe(df_lb[show_cols], use_container_width=True, hide_index=True)
+                else:
+                    st.caption(f"数据日期：{used_date}")
+                    st.info("今日涨停池暂无连板数据。")
 
-        except Exception as e:
-            st.error(f"数据获取失败，可能由于非交易时间或接口限制：{e}")
+            except Exception as e:
+                st.error(f"数据获取失败，可能由于非交易时间或接口限制：{e}")
 
 st.markdown("---")
 
@@ -696,71 +699,73 @@ st.caption(
 )
 
 if st.button("🔫 启动 9:25 终极选股策略"):
-    _stop_if_weekend()
-    log_box = st.expander("📡 实时抓取日志（含今开价异常重试）", expanded=True)
-    log_placeholder = log_box.empty()
-    _bind_picker_logs(log_placeholder)
+    if _block_if_weekend():
+        pass
+    else:
+        log_box = st.expander("📡 实时抓取日志（含今开价异常重试）", expanded=True)
+        log_placeholder = log_box.empty()
+        _bind_picker_logs(log_placeholder)
 
-    with st.spinner("WZ Breaker 正在全网扫描超预期『弱转强』标的（今开未刷新会自动重试）..."):
-        try:
-            date_str, prev_date = picker.get_previous_trade_date()
-            st.write(f"📅 上一交易日：**{date_str}**（{prev_date.strftime('%Y年%m月%d日')}）")
+        with st.spinner("WZ Breaker 正在全网扫描超预期『弱转强』标的（今开未刷新会自动重试）..."):
+            try:
+                date_str, prev_date = picker.get_previous_trade_date()
+                st.write(f"📅 上一交易日：**{date_str}**（{prev_date.strftime('%Y年%m月%d日')}）")
 
-            zt_df = picker.fetch_yesterday_limit_up(date_str)
-            st.write(f"🔥 昨日涨停股一共 **{len(zt_df)}** 只。")
+                zt_df = picker.fetch_yesterday_limit_up(date_str)
+                st.write(f"🔥 昨日涨停股一共 **{len(zt_df)}** 只。")
 
-            candidates = picker.filter_yesterday_candidates(zt_df)
-            if candidates.empty:
-                st.warning("昨日无符合换手率条件的股票，今日空仓。")
-            else:
-                preview = "、".join(
-                    f"{r['名称']}({r['代码']})" for _, r in candidates.head(12).iterrows()
-                )
-                st.write(f"👀 进入今日竞价观察的候选：**{len(candidates)}** 只。{preview}")
-
-                # 核心：模块二仍走东方财富全市场快照（该接口对竞价时段可用）
-                spot = picker.fetch_today_spot()
-                picked = picker.match_weak_to_strong(candidates, spot)
-
-                if picked is None or picked.empty:
-                    st.error("😭 竞价结束，未发现符合 3%-9% 高开条件的股票。执行纪律：管住手！")
+                candidates = picker.filter_yesterday_candidates(zt_df)
+                if candidates.empty:
+                    st.warning("昨日无符合换手率条件的股票，今日空仓。")
                 else:
-                    st.success(f"🎉 狙击成功！WZ Breaker 发现 {len(picked)} 只符合黄金买点的标的！")
-                    df_res = _pretty_result_table(picked)
-                    st.dataframe(
-                        df_res,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "股票代码": st.column_config.TextColumn("股票代码", width="small"),
-                            "股票名称": st.column_config.TextColumn("股票名称", width="small"),
-                            "昨日连板": st.column_config.TextColumn("昨日连板", width="small"),
-                            "昨日换手(%)": st.column_config.NumberColumn("昨日换手(%)", format="%.2f"),
-                            "昨收": st.column_config.NumberColumn("昨收", format="%.2f"),
-                            "今开": st.column_config.NumberColumn("今开", format="%.2f"),
-                            "今日高开(%)": st.column_config.NumberColumn("今日高开(%)", format="%+.2f"),
-                            "建议入场价": st.column_config.NumberColumn("建议入场价", format="%.2f"),
-                            "硬性止损位": st.column_config.NumberColumn("硬性止损位", format="%.2f"),
-                            "逻辑止盈纪律": st.column_config.TextColumn("逻辑止盈纪律", width="large"),
-                        },
+                    preview = "、".join(
+                        f"{r['名称']}({r['代码']})" for _, r in candidates.head(12).iterrows()
                     )
+                    st.write(f"👀 进入今日竞价观察的候选：**{len(candidates)}** 只。{preview}")
 
-                    csv_path = picker.save_csv(picked, date_str)
-                    csv_bytes = df_res.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        "⬇️ 下载本次选股结果 CSV",
-                        data=csv_bytes,
-                        file_name=f"弱转强_{date_str}_{datetime.now().strftime('%H%M%S')}.csv",
-                        mime="text/csv",
-                    )
-                    if csv_path:
-                        st.caption(f"同时已保存到本地：{os.path.abspath(csv_path)}")
+                    # 核心：模块二仍走东方财富全市场快照（该接口对竞价时段可用）
+                    spot = picker.fetch_today_spot()
+                    picked = picker.match_weak_to_strong(candidates, spot)
 
-                    st.caption("以上仅为数据筛选，不构成任何投资建议。股市有风险，入市需谨慎。")
+                    if picked is None or picked.empty:
+                        st.error("😭 竞价结束，未发现符合 3%-9% 高开条件的股票。执行纪律：管住手！")
+                    else:
+                        st.success(f"🎉 狙击成功！WZ Breaker 发现 {len(picked)} 只符合黄金买点的标的！")
+                        df_res = _pretty_result_table(picked)
+                        st.dataframe(
+                            df_res,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "股票代码": st.column_config.TextColumn("股票代码", width="small"),
+                                "股票名称": st.column_config.TextColumn("股票名称", width="small"),
+                                "昨日连板": st.column_config.TextColumn("昨日连板", width="small"),
+                                "昨日换手(%)": st.column_config.NumberColumn("昨日换手(%)", format="%.2f"),
+                                "昨收": st.column_config.NumberColumn("昨收", format="%.2f"),
+                                "今开": st.column_config.NumberColumn("今开", format="%.2f"),
+                                "今日高开(%)": st.column_config.NumberColumn("今日高开(%)", format="%+.2f"),
+                                "建议入场价": st.column_config.NumberColumn("建议入场价", format="%.2f"),
+                                "硬性止损位": st.column_config.NumberColumn("硬性止损位", format="%.2f"),
+                                "逻辑止盈纪律": st.column_config.TextColumn("逻辑止盈纪律", width="large"),
+                            },
+                        )
 
-        except Exception as e:
-            st.error(f"运行报错：{e}")
-            st.error("请检查网络是否正常。若刚过 9:25，今开价可能尚未刷新，稍等几秒再点一次。")
+                        csv_path = picker.save_csv(picked, date_str)
+                        csv_bytes = df_res.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            "⬇️ 下载本次选股结果 CSV",
+                            data=csv_bytes,
+                            file_name=f"弱转强_{date_str}_{datetime.now().strftime('%H%M%S')}.csv",
+                            mime="text/csv",
+                        )
+                        if csv_path:
+                            st.caption(f"同时已保存到本地：{os.path.abspath(csv_path)}")
+
+                        st.caption("以上仅为数据筛选，不构成任何投资建议。股市有风险，入市需谨慎。")
+
+            except Exception as e:
+                st.error(f"运行报错：{e}")
+                st.error("请检查网络是否正常。若刚过 9:25，今开价可能尚未刷新，稍等几秒再点一次。")
 
 st.markdown("---")
 
@@ -771,116 +776,118 @@ st.header("🌅 模块三：14:50 尾盘潜伏系统")
 st.info("💡 操作指南：请在交易日下午 14:50 左右点击运行。尾盘买入，次日早盘冲高即卖，规避 T+1 日内波动风险。")
 
 if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
-    _stop_if_weekend()
-    with st.spinner("WZ Breaker 正在扫描尾盘强资金抢筹标的..."):
-        try:
-            df_spot = get_spot_data_with_retry(need_ohlc=True)
-            if df_spot is None or df_spot.empty:
-                raise ValueError("全市场行情接口返回为空")
+    if _block_if_weekend():
+        pass
+    else:
+        with st.spinner("WZ Breaker 正在扫描尾盘强资金抢筹标的..."):
+            try:
+                df_spot = get_spot_data_with_retry(need_ohlc=True)
+                if df_spot is None or df_spot.empty:
+                    raise ValueError("全市场行情接口返回为空")
 
-            df = df_spot.copy()
-            df["代码"] = _normalize_code_series(df["代码"])
-            df = _to_numeric_cols(df, ["涨跌幅", "换手率", "最新价", "最高"])
+                df = df_spot.copy()
+                df["代码"] = _normalize_code_series(df["代码"])
+                df = _to_numeric_cols(df, ["涨跌幅", "换手率", "最新价", "最高"])
 
-            df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
-            df = df[~df["代码"].str.startswith("688")]
-            df = df[~df["代码"].str.startswith("300")]
-            df = df[(df["涨跌幅"] >= 3.0) & (df["涨跌幅"] <= 7.0)]
-            if "换手率" in df.columns:
-                df = df[df["换手率"] >= 5.0]
-            if "最高" in df.columns:
-                df = df[df["最高"] > 0]
-                df = df[df["最新价"] >= df["最高"] * 0.985]
+                df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
+                df = df[~df["代码"].str.startswith("688")]
+                df = df[~df["代码"].str.startswith("300")]
+                df = df[(df["涨跌幅"] >= 3.0) & (df["涨跌幅"] <= 7.0)]
+                if "换手率" in df.columns:
+                    df = df[df["换手率"] >= 5.0]
+                if "最高" in df.columns:
+                    df = df[df["最高"] > 0]
+                    df = df[df["最新价"] >= df["最高"] * 0.985]
 
-            if "成交额" in df.columns:
-                df["成交额(亿)"] = _amount_to_yi(df["成交额"])
+                if "成交额" in df.columns:
+                    df["成交额(亿)"] = _amount_to_yi(df["成交额"])
 
-            n_basic = len(df)
-            show_cols = [
-                c
-                for c in [
-                    "代码",
-                    "名称",
-                    "最新价",
-                    "涨跌幅",
-                    "换手率",
-                    "最高",
-                    "成交额(亿)",
-                    "主力净流入_快照",
-                    "五日主力净流入",
+                n_basic = len(df)
+                show_cols = [
+                    c
+                    for c in [
+                        "代码",
+                        "名称",
+                        "最新价",
+                        "涨跌幅",
+                        "换手率",
+                        "最高",
+                        "成交额(亿)",
+                        "主力净流入_快照",
+                        "五日主力净流入",
+                    ]
+                    if c in df.columns
                 ]
-                if c in df.columns
-            ]
-            if "换手率" in df.columns:
-                df_res = df[show_cols].sort_values(by="换手率", ascending=False).head(20).reset_index(drop=True)
-            else:
-                df_res = df[show_cols].head(20).reset_index(drop=True)
-
-            if df_res.empty:
-                st.error("今日尾盘无符合强资金抢筹特征的标的，管住手")
-            else:
-                st.write(
-                    f"基础筛选入围 {n_basic} 只，截取换手率最高的前 20 只进行深度资金分析 (预计耗时20秒)..."
-                )
-                df_res = _enrich_module3_advanced(df_res)
-                if "主力净流入(万)" in df_res.columns:
-                    df_res = df_res.copy()
-                    df_res["sort_val"] = pd.to_numeric(df_res["主力净流入(万)"], errors="coerce")
-                    df_res["sort_val"] = df_res["sort_val"].fillna(-999999)
-                    df_res = df_res.sort_values(by="sort_val", ascending=False)
-                    df_res = df_res.drop(columns=["sort_val"]).head(10).reset_index(drop=True)
+                if "换手率" in df.columns:
+                    df_res = df[show_cols].sort_values(by="换手率", ascending=False).head(20).reset_index(drop=True)
                 else:
-                    df_res = df_res.head(10).reset_index(drop=True)
-                st.success("🤖 Stock-Bot 已为您自动按『主力净流入』降序排列，并精选出全市场资金抢筹最凶的前 10 大核心标的！")
-                st.dataframe(
-                    df_res,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "代码": st.column_config.TextColumn("代码", width="small"),
-                        "名称": st.column_config.TextColumn("名称", width="small"),
-                        "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
-                        "涨跌幅": st.column_config.NumberColumn("涨跌幅", format="%+.2f"),
-                        "换手率": st.column_config.NumberColumn("换手率", format="%.2f"),
-                        "最高": st.column_config.NumberColumn("最高", format="%.2f"),
-                        "成交额(亿)": st.column_config.NumberColumn("成交额(亿)", format="%.2f"),
-                        "主力净流入(万)": st.column_config.TextColumn("主力净流入(万)"),
-                        "近5日涨跌幅(%)": st.column_config.TextColumn("近5日涨跌幅(%)"),
-                        "近20日涨跌幅(%)": st.column_config.TextColumn("近20日涨跌幅(%)"),
-                    },
-                )
-                st.caption("以上仅为数据筛选，不构成任何投资建议。股市有风险，入市需谨慎。")
+                    df_res = df[show_cols].head(20).reset_index(drop=True)
 
-                st.markdown("### 🎯 核心标的次日操盘计划 (执行表)")
-                last_px = pd.to_numeric(df_res["最新价"], errors="coerce")
-                df_plan = pd.DataFrame(
-                    {
-                        "代码": df_res["代码"],
-                        "名称": df_res["名称"],
-                        "建议入场价": last_px.astype(float).round(2),
-                        "明日冲板阻力位": (last_px * 1.095).astype(float).round(2),
-                        "硬性防守线(-3.5%)": (last_px * 0.965).astype(float).round(2),
-                        "逻辑止盈纪律": "动态止盈：急拉不板遇阻卖；若平/低开，盯死分时黄线(即分时图上的均价线)，站稳格局，破位出局",
-                    }
-                )
-                st.dataframe(
-                    df_plan,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "代码": st.column_config.TextColumn("代码", width="small"),
-                        "名称": st.column_config.TextColumn("名称", width="small"),
-                        "建议入场价": st.column_config.NumberColumn("建议入场价", format="%.2f"),
-                        "明日冲板阻力位": st.column_config.NumberColumn("明日冲板阻力位", format="%.2f"),
-                        "硬性防守线(-3.5%)": st.column_config.NumberColumn("硬性防守线(-3.5%)", format="%.2f"),
-                        "逻辑止盈纪律": st.column_config.TextColumn("逻辑止盈纪律", width="large"),
-                    },
-                )
-                st.caption("注：尾盘潜伏博弈的是次日早盘溢价，无论盈亏，次日早盘10:00前建议了结，绝不恋战。")
+                if df_res.empty:
+                    st.error("今日尾盘无符合强资金抢筹特征的标的，管住手")
+                else:
+                    st.write(
+                        f"基础筛选入围 {n_basic} 只，截取换手率最高的前 20 只进行深度资金分析 (预计耗时20秒)..."
+                    )
+                    df_res = _enrich_module3_advanced(df_res)
+                    if "主力净流入(万)" in df_res.columns:
+                        df_res = df_res.copy()
+                        df_res["sort_val"] = pd.to_numeric(df_res["主力净流入(万)"], errors="coerce")
+                        df_res["sort_val"] = df_res["sort_val"].fillna(-999999)
+                        df_res = df_res.sort_values(by="sort_val", ascending=False)
+                        df_res = df_res.drop(columns=["sort_val"]).head(10).reset_index(drop=True)
+                    else:
+                        df_res = df_res.head(10).reset_index(drop=True)
+                    st.success("🤖 Stock-Bot 已为您自动按『主力净流入』降序排列，并精选出全市场资金抢筹最凶的前 10 大核心标的！")
+                    st.dataframe(
+                        df_res,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "代码": st.column_config.TextColumn("代码", width="small"),
+                            "名称": st.column_config.TextColumn("名称", width="small"),
+                            "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
+                            "涨跌幅": st.column_config.NumberColumn("涨跌幅", format="%+.2f"),
+                            "换手率": st.column_config.NumberColumn("换手率", format="%.2f"),
+                            "最高": st.column_config.NumberColumn("最高", format="%.2f"),
+                            "成交额(亿)": st.column_config.NumberColumn("成交额(亿)", format="%.2f"),
+                            "主力净流入(万)": st.column_config.TextColumn("主力净流入(万)"),
+                            "近5日涨跌幅(%)": st.column_config.TextColumn("近5日涨跌幅(%)"),
+                            "近20日涨跌幅(%)": st.column_config.TextColumn("近20日涨跌幅(%)"),
+                        },
+                    )
+                    st.caption("以上仅为数据筛选，不构成任何投资建议。股市有风险，入市需谨慎。")
 
-        except Exception as e:
-            st.error(f"运行报错：{e}")
-            st.error("请检查网络是否正常。建议在交易日 14:50 左右、行情接口可用时再扫一次。")
+                    st.markdown("### 🎯 核心标的次日操盘计划 (执行表)")
+                    last_px = pd.to_numeric(df_res["最新价"], errors="coerce")
+                    df_plan = pd.DataFrame(
+                        {
+                            "代码": df_res["代码"],
+                            "名称": df_res["名称"],
+                            "建议入场价": last_px.astype(float).round(2),
+                            "明日冲板阻力位": (last_px * 1.095).astype(float).round(2),
+                            "硬性防守线(-3.5%)": (last_px * 0.965).astype(float).round(2),
+                            "逻辑止盈纪律": "动态止盈：急拉不板遇阻卖；若平/低开，盯死分时黄线(即分时图上的均价线)，站稳格局，破位出局",
+                        }
+                    )
+                    st.dataframe(
+                        df_plan,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "代码": st.column_config.TextColumn("代码", width="small"),
+                            "名称": st.column_config.TextColumn("名称", width="small"),
+                            "建议入场价": st.column_config.NumberColumn("建议入场价", format="%.2f"),
+                            "明日冲板阻力位": st.column_config.NumberColumn("明日冲板阻力位", format="%.2f"),
+                            "硬性防守线(-3.5%)": st.column_config.NumberColumn("硬性防守线(-3.5%)", format="%.2f"),
+                            "逻辑止盈纪律": st.column_config.TextColumn("逻辑止盈纪律", width="large"),
+                        },
+                    )
+                    st.caption("注：尾盘潜伏博弈的是次日早盘溢价，无论盈亏，次日早盘10:00前建议了结，绝不恋战。")
+
+            except Exception as e:
+                st.error(f"运行报错：{e}")
+                st.error("请检查网络是否正常。建议在交易日 14:50 左右、行情接口可用时再扫一次。")
 
 st.markdown("---")
 
@@ -891,93 +898,95 @@ st.header("📈 模块四：趋势中军·放量起爆雷达")
 st.info("💡 操作指南：盘中随时可看。专门捕捉 50-500亿盘子、处于中期上升通道、今日突然放量突破的『趋势核心龙』。适合中线波段持有。")
 
 if st.button("📡 启动趋势雷达扫描"):
-    _stop_if_weekend()
-    with st.spinner("WZ Breaker 正在扫描趋势中军·放量起爆标的..."):
-        try:
-            df_spot = get_spot_data_with_retry()
-            if df_spot is None or df_spot.empty:
-                raise ValueError("全市场行情接口返回为空")
+    if _block_if_weekend():
+        pass
+    else:
+        with st.spinner("WZ Breaker 正在扫描趋势中军·放量起爆标的..."):
+            try:
+                df_spot = get_spot_data_with_retry()
+                if df_spot is None or df_spot.empty:
+                    raise ValueError("全市场行情接口返回为空")
 
-            df = df_spot.copy()
-            df["代码"] = _normalize_code_series(df["代码"])
-            df = _to_numeric_cols(df, ["最新价", "涨跌幅", "量比", "60日涨跌幅", "总市值", "换手率"])
+                df = df_spot.copy()
+                df["代码"] = _normalize_code_series(df["代码"])
+                df = _to_numeric_cols(df, ["最新价", "涨跌幅", "量比", "60日涨跌幅", "总市值", "换手率"])
 
-            df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
-            df = df[~df["代码"].str.startswith("688")]
-            df = df[~df["代码"].str.startswith("300")]
-            df = df[(df["涨跌幅"] >= 4.0) & (df["涨跌幅"] <= 8.0)]
-            if "总市值" in df.columns:
-                df = df[(df["总市值"] >= 5000000000) & (df["总市值"] <= 50000000000)]
-            if "60日涨跌幅" in df.columns:
-                df = df[(df["60日涨跌幅"] >= 20) & (df["60日涨跌幅"] <= 80)]
-            if "量比" in df.columns:
-                df = df[df["量比"] >= 2.0]
-            elif "成交额" in df.columns:
-                df["成交额"] = pd.to_numeric(df["成交额"], errors="coerce")
-                cutoff = df["成交额"].quantile(0.7)
-                df = df[df["成交额"] >= cutoff]
-            if "换手率" in df.columns:
-                df = df[df["换手率"] >= 5.0]
+                df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
+                df = df[~df["代码"].str.startswith("688")]
+                df = df[~df["代码"].str.startswith("300")]
+                df = df[(df["涨跌幅"] >= 4.0) & (df["涨跌幅"] <= 8.0)]
+                if "总市值" in df.columns:
+                    df = df[(df["总市值"] >= 5000000000) & (df["总市值"] <= 50000000000)]
+                if "60日涨跌幅" in df.columns:
+                    df = df[(df["60日涨跌幅"] >= 20) & (df["60日涨跌幅"] <= 80)]
+                if "量比" in df.columns:
+                    df = df[df["量比"] >= 2.0]
+                elif "成交额" in df.columns:
+                    df["成交额"] = pd.to_numeric(df["成交额"], errors="coerce")
+                    cutoff = df["成交额"].quantile(0.7)
+                    df = df[df["成交额"] >= cutoff]
+                if "换手率" in df.columns:
+                    df = df[df["换手率"] >= 5.0]
 
-            if "成交额" in df.columns:
-                df["成交额(亿)"] = _amount_to_yi(df["成交额"])
+                if "成交额" in df.columns:
+                    df["成交额(亿)"] = _amount_to_yi(df["成交额"])
 
-            show_cols = [
-                c
-                for c in [
-                    "代码",
-                    "名称",
-                    "最新价",
-                    "涨跌幅",
-                    "量比",
-                    "60日涨跌幅",
-                    "总市值",
-                    "成交额(亿)",
-                    "主力净流入_快照",
-                    "五日主力净流入",
+                show_cols = [
+                    c
+                    for c in [
+                        "代码",
+                        "名称",
+                        "最新价",
+                        "涨跌幅",
+                        "量比",
+                        "60日涨跌幅",
+                        "总市值",
+                        "成交额(亿)",
+                        "主力净流入_快照",
+                        "五日主力净流入",
+                    ]
+                    if c in df.columns
                 ]
-                if c in df.columns
-            ]
-            sort_cols = [c for c in ["量比", "涨跌幅"] if c in df.columns]
-            df_res = df[show_cols].sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
-            if "成交额(亿)" not in df_res.columns:
-                df_res["成交额(亿)"] = "暂无数据"
-            if "总市值" in df_res.columns:
-                df_res["总市值"] = (df_res["总市值"] / 100000000).round(0).astype("Int64").astype(str) + " 亿元"
-            df_res["买入建议"] = "今日放量跟随买入/逢均线低吸"
-            df_res["卖出/止损纪律"] = "收盘跌破 10日/20日均线无条件止损"
+                sort_cols = [c for c in ["量比", "涨跌幅"] if c in df.columns]
+                df_res = df[show_cols].sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
+                if "成交额(亿)" not in df_res.columns:
+                    df_res["成交额(亿)"] = "暂无数据"
+                if "总市值" in df_res.columns:
+                    df_res["总市值"] = (df_res["总市值"] / 100000000).round(0).astype("Int64").astype(str) + " 亿元"
+                df_res["买入建议"] = "今日放量跟随买入/逢均线低吸"
+                df_res["卖出/止损纪律"] = "收盘跌破 10日/20日均线无条件止损"
 
-            if df_res.empty:
-                st.error("今日无符合趋势中军·放量起爆特征的标的，管住手")
-            else:
-                st.info(f"基础筛选入围 {len(df_res)} 只，开始逐只补抓近五日资金流与区间涨跌（每只间隔约 2 秒，防止封 IP）…")
-                df_res = _enrich_module3_advanced(df_res, flow_days=5)
-                st.success(f"🎉 趋势雷达扫描完成，发现 {len(df_res)} 只趋势核心龙。")
-                st.dataframe(
-                    df_res,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "代码": st.column_config.TextColumn("代码", width="small"),
-                        "名称": st.column_config.TextColumn("名称", width="small"),
-                        "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
-                        "涨跌幅": st.column_config.NumberColumn("涨跌幅", format="%+.2f"),
-                        "量比": st.column_config.NumberColumn("量比", format="%.2f"),
-                        "60日涨跌幅": st.column_config.NumberColumn("60日涨跌幅", format="%+.2f"),
-                        "总市值": st.column_config.TextColumn("总市值", width="small"),
-                        "成交额(亿)": st.column_config.NumberColumn("成交额(亿)", format="%.2f"),
-                        "主力净流入(万)": st.column_config.TextColumn("主力净流入(万)"),
-                        "近5日涨跌幅(%)": st.column_config.TextColumn("近5日涨跌幅(%)"),
-                        "近20日涨跌幅(%)": st.column_config.TextColumn("近20日涨跌幅(%)"),
-                        "买入建议": st.column_config.TextColumn("买入建议", width="medium"),
-                        "卖出/止损纪律": st.column_config.TextColumn("卖出/止损纪律", width="large"),
-                    },
-                )
-                st.caption("以上仅为数据筛选，不构成任何投资建议。股市有风险，入市需谨慎。")
+                if df_res.empty:
+                    st.error("今日无符合趋势中军·放量起爆特征的标的，管住手")
+                else:
+                    st.info(f"基础筛选入围 {len(df_res)} 只，开始逐只补抓近五日资金流与区间涨跌（每只间隔约 2 秒，防止封 IP）…")
+                    df_res = _enrich_module3_advanced(df_res, flow_days=5)
+                    st.success(f"🎉 趋势雷达扫描完成，发现 {len(df_res)} 只趋势核心龙。")
+                    st.dataframe(
+                        df_res,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "代码": st.column_config.TextColumn("代码", width="small"),
+                            "名称": st.column_config.TextColumn("名称", width="small"),
+                            "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
+                            "涨跌幅": st.column_config.NumberColumn("涨跌幅", format="%+.2f"),
+                            "量比": st.column_config.NumberColumn("量比", format="%.2f"),
+                            "60日涨跌幅": st.column_config.NumberColumn("60日涨跌幅", format="%+.2f"),
+                            "总市值": st.column_config.TextColumn("总市值", width="small"),
+                            "成交额(亿)": st.column_config.NumberColumn("成交额(亿)", format="%.2f"),
+                            "主力净流入(万)": st.column_config.TextColumn("主力净流入(万)"),
+                            "近5日涨跌幅(%)": st.column_config.TextColumn("近5日涨跌幅(%)"),
+                            "近20日涨跌幅(%)": st.column_config.TextColumn("近20日涨跌幅(%)"),
+                            "买入建议": st.column_config.TextColumn("买入建议", width="medium"),
+                            "卖出/止损纪律": st.column_config.TextColumn("卖出/止损纪律", width="large"),
+                        },
+                    )
+                    st.caption("以上仅为数据筛选，不构成任何投资建议。股市有风险，入市需谨慎。")
 
-        except Exception as e:
-            st.error(f"运行报错：{e}")
-            st.error("请检查网络是否正常。建议在交易时段行情接口可用时再扫一次。")
+            except Exception as e:
+                st.error(f"运行报错：{e}")
+                st.error("请检查网络是否正常。建议在交易时段行情接口可用时再扫一次。")
 
 st.markdown("---")
 
@@ -988,62 +997,64 @@ st.header("🗓️ 模块五：1-2月期『机构抱团』价值趋势共振")
 st.info("💡 战略投资指南：本模块旨在挖掘【基本面优秀 + 中大市值 + 处于温和上升通道】的机构重仓股。按 1~2 个月周期布局，做时间的朋友，告别盯盘焦虑。")
 
 if st.button("🔭 启动中长线价值雷达扫描"):
-    _stop_if_weekend()
-    with st.spinner("WZ Breaker 正在扫描机构抱团·价值趋势共振标的..."):
-        try:
-            df_spot = get_spot_data_with_retry()
-            if df_spot is None or df_spot.empty:
-                raise ValueError("全市场行情接口返回为空")
+    if _block_if_weekend():
+        pass
+    else:
+        with st.spinner("WZ Breaker 正在扫描机构抱团·价值趋势共振标的..."):
+            try:
+                df_spot = get_spot_data_with_retry()
+                if df_spot is None or df_spot.empty:
+                    raise ValueError("全市场行情接口返回为空")
 
-            df = df_spot.copy()
-            df["代码"] = _normalize_code_series(df["代码"])
-            df = _to_numeric_cols(df, ["最新价", "市盈率-动态", "60日涨跌幅", "总市值", "年初至今涨跌幅", "换手率"])
+                df = df_spot.copy()
+                df["代码"] = _normalize_code_series(df["代码"])
+                df = _to_numeric_cols(df, ["最新价", "市盈率-动态", "60日涨跌幅", "总市值", "年初至今涨跌幅", "换手率"])
 
-            df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
-            if "市盈率-动态" in df.columns:
-                df = df[(df["市盈率-动态"] >= 5) & (df["市盈率-动态"] <= 40)]
-            if "总市值" in df.columns:
-                df = df[df["总市值"] >= 10000000000]
-            if "60日涨跌幅" in df.columns:
-                df = df[(df["60日涨跌幅"] >= 10) & (df["60日涨跌幅"] <= 40)]
-            if "换手率" in df.columns:
-                df = df[(df["换手率"] >= 1.0) & (df["换手率"] <= 8.0)]
+                df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
+                if "市盈率-动态" in df.columns:
+                    df = df[(df["市盈率-动态"] >= 5) & (df["市盈率-动态"] <= 40)]
+                if "总市值" in df.columns:
+                    df = df[df["总市值"] >= 10000000000]
+                if "60日涨跌幅" in df.columns:
+                    df = df[(df["60日涨跌幅"] >= 10) & (df["60日涨跌幅"] <= 40)]
+                if "换手率" in df.columns:
+                    df = df[(df["换手率"] >= 1.0) & (df["换手率"] <= 8.0)]
 
-            show_cols = [
-                c
-                for c in ["代码", "名称", "最新价", "市盈率-动态", "60日涨跌幅", "总市值", "年初至今涨跌幅"]
-                if c in df.columns
-            ]
-            sort_cols = [c for c in ["60日涨跌幅", "总市值"] if c in df.columns]
-            df_res = df[show_cols].sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
+                show_cols = [
+                    c
+                    for c in ["代码", "名称", "最新价", "市盈率-动态", "60日涨跌幅", "总市值", "年初至今涨跌幅"]
+                    if c in df.columns
+                ]
+                sort_cols = [c for c in ["60日涨跌幅", "总市值"] if c in df.columns]
+                df_res = df[show_cols].sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
 
-            if df_res.empty:
-                st.error("当前市场无符合低估值+中线走强的稳健标的，建议等待")
-            else:
-                df_res["市盈率-动态"] = df_res["市盈率-动态"].round(1)
-                df_res["总市值"] = (df_res["总市值"] / 100000000).round(0).astype("int64").astype(str) + " 亿元"
-                df_res["建仓策略"] = "底仓首抛，遇大盘暴跌分批逢低吸纳"
-                df_res["持股纪律"] = "以20日线为强弱分界，跌破60日线彻底清仓"
+                if df_res.empty:
+                    st.error("当前市场无符合低估值+中线走强的稳健标的，建议等待")
+                else:
+                    df_res["市盈率-动态"] = df_res["市盈率-动态"].round(1)
+                    df_res["总市值"] = (df_res["总市值"] / 100000000).round(0).astype("int64").astype(str) + " 亿元"
+                    df_res["建仓策略"] = "底仓首抛，遇大盘暴跌分批逢低吸纳"
+                    df_res["持股纪律"] = "以20日线为强弱分界，跌破60日线彻底清仓"
 
-                st.success(f"🎉 价值雷达扫描完成，发现 {len(df_res)} 只机构抱团稳健标的。")
-                st.dataframe(
-                    df_res,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "代码": st.column_config.TextColumn("代码", width="small"),
-                        "名称": st.column_config.TextColumn("名称", width="small"),
-                        "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
-                        "市盈率-动态": st.column_config.NumberColumn("市盈率-动态", format="%.1f"),
-                        "60日涨跌幅": st.column_config.NumberColumn("60日涨跌幅", format="%+.2f"),
-                        "总市值": st.column_config.TextColumn("总市值", width="small"),
-                        "年初至今涨跌幅": st.column_config.NumberColumn("年初至今涨跌幅", format="%+.2f"),
-                        "建仓策略": st.column_config.TextColumn("建仓策略", width="medium"),
-                        "持股纪律": st.column_config.TextColumn("持股纪律", width="large"),
-                    },
-                )
-                st.caption("以上仅为数据筛选，不构成任何投资建议。股市有风险，入市需谨慎。")
+                    st.success(f"🎉 价值雷达扫描完成，发现 {len(df_res)} 只机构抱团稳健标的。")
+                    st.dataframe(
+                        df_res,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "代码": st.column_config.TextColumn("代码", width="small"),
+                            "名称": st.column_config.TextColumn("名称", width="small"),
+                            "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
+                            "市盈率-动态": st.column_config.NumberColumn("市盈率-动态", format="%.1f"),
+                            "60日涨跌幅": st.column_config.NumberColumn("60日涨跌幅", format="%+.2f"),
+                            "总市值": st.column_config.TextColumn("总市值", width="small"),
+                            "年初至今涨跌幅": st.column_config.NumberColumn("年初至今涨跌幅", format="%+.2f"),
+                            "建仓策略": st.column_config.TextColumn("建仓策略", width="medium"),
+                            "持股纪律": st.column_config.TextColumn("持股纪律", width="large"),
+                        },
+                    )
+                    st.caption("以上仅为数据筛选，不构成任何投资建议。股市有风险，入市需谨慎。")
 
-        except Exception as e:
-            st.error(f"运行报错：{e}")
-            st.error("请检查网络是否正常。建议在交易时段行情接口可用时再扫一次。")
+            except Exception as e:
+                st.error(f"运行报错：{e}")
+                st.error("请检查网络是否正常。建议在交易时段行情接口可用时再扫一次。")
