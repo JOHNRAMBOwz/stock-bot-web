@@ -236,21 +236,38 @@ def _normalize_sina_spot(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fill_derived_prices(df: pd.DataFrame) -> pd.DataFrame:
-    """腾讯榜单没有今开/昨收/最高时，用现价和涨跌幅尽量补齐。"""
+    """昨收可以用现价和涨跌幅还原。今开不能用现价代替，否则 9:30 之后高开会算错。"""
     df = df.copy()
-    df = _to_numeric_cols(df, ["最新价", "涨跌幅", "今开", "昨收", "最高"])
+    df = _to_numeric_cols(df, ["最新价", "涨跌幅", "今开", "昨收", "最高", "最低"])
     if "昨收" not in df.columns:
         df["昨收"] = pd.NA
     need_prev = df["昨收"].isna() | (df["昨收"] <= 0)
-    if need_prev.any():
+    if need_prev.any() and "最新价" in df.columns and "涨跌幅" in df.columns:
         df.loc[need_prev, "昨收"] = df.loc[need_prev, "最新价"] / (1 + df.loc[need_prev, "涨跌幅"] / 100.0)
     if "今开" not in df.columns:
         df["今开"] = pd.NA
-    need_open = df["今开"].isna() | (df["今开"] <= 0)
-    if need_open.any():
-        # 9:25 竞价刚结束时最新价≈今开；盘中则作为兜底，避免模块二直接崩溃
-        df.loc[need_open, "今开"] = df.loc[need_open, "最新价"]
     return df
+
+
+def _auction_open_ready(df: pd.DataFrame) -> bool:
+    """今开已写入，且全市场不是整表涨跌幅为 0 的过期快照。"""
+    if df is None or df.empty or "今开" not in df.columns:
+        return False
+    opened = pd.to_numeric(df["今开"], errors="coerce")
+    if float((opened.notna() & (opened > 0)).mean()) < 0.5:
+        return False
+    if "涨跌幅" not in df.columns:
+        return True
+    pct = pd.to_numeric(df["涨跌幅"], errors="coerce")
+    moved = pct.notna() & (pct.abs() > 0.05)
+    return float(moved.mean()) >= 0.05
+
+
+def _stamp_snapshot(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    out = df.copy()
+    out.attrs["snapshot_source"] = source
+    out.attrs["open_ready"] = _auction_open_ready(out)
+    return out
 
 
 _SNAPSHOT_NUMERIC = [
@@ -300,7 +317,7 @@ def _normalize_em_spot(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def _map_backup_to_em_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """把新浪/腾讯列名洗成东财格式，缺的价格用现价和涨跌幅补上。"""
+    """把新浪/腾讯列名洗成东财格式。今开留空，不用现价冒充。"""
     df = _fill_derived_prices(df)
     if "最低" not in df.columns:
         df["最低"] = pd.NA
@@ -323,6 +340,7 @@ def _merge_backup_snapshots(sina_df: pd.DataFrame | None, tx_df: pd.DataFrame | 
     if tx_df is None:
         return _map_backup_to_em_columns(sina_df)
 
+    # 价格以新浪为准。腾讯只补换手、量比、市值和资金，避免覆盖真实今开。
     fill_cols = [
         c
         for c in [
@@ -334,14 +352,6 @@ def _merge_backup_snapshots(sina_df: pd.DataFrame | None, tx_df: pd.DataFrame | 
             "主力净流入_快照",
             "五日主力净流入",
             "市盈率-动态",
-            "最高",
-            "最低",
-            "今开",
-            "昨收",
-            "最新价",
-            "涨跌幅",
-            "成交额",
-            "名称",
         ]
         if c in tx_df.columns
     ]
@@ -365,26 +375,36 @@ def _merge_backup_snapshots(sina_df: pd.DataFrame | None, tx_df: pd.DataFrame | 
     return _map_backup_to_em_columns(merged)
 
 
-def _fetch_eastmoney_spot(max_retries: int = 3) -> pd.DataFrame | None:
-    """引擎 A：东财全市场快照。失败后随机停 1~3 秒再试，最多 3 次。"""
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            print(f"正在获取东方财富全市场行情（第 {attempt}/{max_retries} 次）...")
-            df = ak.stock_zh_a_spot_em()
-            if df is None or df.empty:
-                raise ValueError("接口返回了空表格")
-            print(f"东方财富全市场行情完成，共 {len(df)} 行。")
-            return _normalize_em_spot(df)
-        except Exception as exc:
-            last_error = exc
-            print(f"警告：东方财富失败（第 {attempt}/{max_retries} 次）：{exc}")
-            if attempt < max_retries:
-                wait = random.uniform(1, 3)
-                print(f"随机休眠 {wait:.1f} 秒后重试东方财富...")
-                time.sleep(wait)
-    print(f"东方财富连续失败 {max_retries} 次，切换新浪/腾讯备用线路：{last_error}")
-    return None
+def _fetch_eastmoney_spot() -> pd.DataFrame | None:
+    """东财只抓一次。整表分页连打三次更容易被掐断。"""
+    try:
+        print("正在获取东方财富全市场行情（只试 1 次）...")
+        df = ak.stock_zh_a_spot_em()
+        if df is None or df.empty:
+            raise ValueError("接口返回了空表格")
+        print(f"东方财富全市场行情完成，共 {len(df)} 行。")
+        return _normalize_em_spot(df)
+    except Exception as exc:
+        print(f"警告：东方财富失败，不再重试，改走新浪：{exc}")
+        return None
+
+
+def _fetch_sina_spot() -> pd.DataFrame:
+    return _try_fetch_spot(
+        lambda: _normalize_sina_spot(ak.stock_zh_a_spot()),
+        desc="获取新浪全市场行情",
+        max_retries=1,
+        delay=0,
+    )
+
+
+def _fetch_tencent_spot() -> pd.DataFrame:
+    return _try_fetch_spot(
+        lambda: _normalize_tencent_spot(ak.stock_zh_a_spot_tx()),
+        desc="获取腾讯全市场行情",
+        max_retries=1,
+        delay=0,
+    )
 
 
 def _beijing_now() -> datetime:
@@ -401,53 +421,65 @@ def _block_if_weekend() -> bool:
     return False
 
 
-def get_spot_data_with_retry(max_retries=3, delay=2, need_ohlc=False) -> pd.DataFrame:
+def get_spot_data_with_retry(max_retries=1, delay=2, need_ohlc=False) -> pd.DataFrame:
     """
-    全市场实时快照。
+    一次点击只抓一份价格快照。
 
-    引擎 A：东方财富 ak.stock_zh_a_spot_em()，失败后随机休眠 1~3 秒，最多 3 次。
-    引擎 B：东财连续失败后不中断，改走新浪 ak.stock_zh_a_spot()，再用腾讯补换手率等字段。
-    返回列名与东财对齐：代码、名称、最新价、涨跌幅、换手率、最高、最低、今开、昨收。
-    need_ohlc 保留给调用方；东财和新浪本身带开高低收，备用合并时也会补齐。
+    东财成功且今开可用时直接返回，不再连打。
+    东财失败，或 9:25 今开还没写上，改用新浪的真实今开。
+    今开仍未刷新时，只再等 8 秒向新浪要一次。
+    腾讯只在尾盘/盘中需要换手率、且新浪没有该列时补一次，不覆盖今开。
     """
+    del max_retries, delay
     try:
-        em_df = _fetch_eastmoney_spot(max_retries=max_retries)
-        if em_df is not None and not em_df.empty:
-            return _map_backup_to_em_columns(em_df)
+        em_df = _fetch_eastmoney_spot()
     except Exception as exc:
-        print(f"警告：东方财富主干道异常，转入备用线路：{exc}")
+        em_df = None
+        print(f"警告：东方财富异常，转入新浪：{exc}")
+
+    if em_df is not None and not em_df.empty:
+        ready = _auction_open_ready(em_df)
+        if (not need_ohlc) or ready:
+            print(f"使用东方财富快照，共 {len(em_df)} 行。")
+            return _stamp_snapshot(_map_backup_to_em_columns(em_df), "东方财富")
+        print("东方财富已返回，但今开尚未刷新，改向新浪要开盘价。")
 
     sina_df = None
-    tx_df = None
     errors = []
     try:
-        sina_df = _try_fetch_spot(
-            lambda: _normalize_sina_spot(ak.stock_zh_a_spot()),
-            desc="获取新浪全市场行情",
-            max_retries=max_retries,
-            delay=delay,
-        )
+        sina_df = _fetch_sina_spot()
     except Exception as exc:
         errors.append(str(exc))
-        print(f"警告：新浪备用线路不可用：{exc}")
+        print(f"警告：新浪行情不可用：{exc}")
 
-    try:
-        tx_retries = 1 if sina_df is not None else max_retries
-        tx_df = _try_fetch_spot(
-            lambda: _normalize_tencent_spot(ak.stock_zh_a_spot_tx()),
-            desc="获取腾讯全市场行情",
-            max_retries=tx_retries,
-            delay=delay,
-        )
-    except Exception as exc:
-        errors.append(str(exc))
-        print(f"警告：腾讯备用线路不可用：{exc}")
+    if need_ohlc and sina_df is not None and not _auction_open_ready(_map_backup_to_em_columns(sina_df)):
+        print("今开尚未刷新，8 秒后只再向新浪要一次...")
+        time.sleep(8)
+        try:
+            sina_df = _fetch_sina_spot()
+        except Exception as exc:
+            errors.append(str(exc))
+            print(f"警告：新浪第二次抓取失败，沿用上一份：{exc}")
+
+    tx_df = None
+    turnover_missing = sina_df is None or "换手率" not in sina_df.columns or not sina_df["换手率"].notna().any()
+    if (not need_ohlc) and turnover_missing:
+        try:
+            tx_df = _fetch_tencent_spot()
+        except Exception as exc:
+            errors.append(str(exc))
+            print(f"警告：腾讯补换手率失败：{exc}")
 
     merged = _merge_backup_snapshots(sina_df, tx_df)
-    if merged is not None and not merged.empty:
-        print(f"已切换到备用行情，共 {len(merged)} 行。")
-        return merged
-    raise RuntimeError("东方财富、新浪、腾讯全市场行情均失败：{}".format("；".join(errors) or "无可用数据"))
+    if merged is None or merged.empty:
+        raise RuntimeError("东方财富与新浪全市场行情均失败：{}".format("；".join(errors) or "无可用数据"))
+    source = "新浪"
+    if tx_df is not None:
+        source = "新浪+腾讯补换手"
+    elif sina_df is None:
+        source = "腾讯"
+    print(f"使用{source}快照，共 {len(merged)} 行。")
+    return _stamp_snapshot(merged, source)
 
 
 def _market_of_code(code: str) -> str:
@@ -847,16 +879,25 @@ if st.button("🔫 启动 9:25 终极选股策略"):
                     )
                     st.write(f"👀 进入今日竞价观察的候选：**{len(candidates)}** 只。{preview}")
 
-                    # 东财优先；连续 3 次失败后自动改用新浪/腾讯，列名已洗成今开/昨收
+                    # 9:25 只认真实今开。东财一次，失败再用新浪；今开没刷出来就不计算高开。
                     spot = get_spot_data_with_retry(need_ohlc=True)
-                    picked = picker.match_weak_to_strong(candidates, spot)
-                    if picked is not None and not picked.empty:
-                        turn = pd.to_numeric(picked["换手率"], errors="coerce")
-                        gap = pd.to_numeric(picked["高开幅度"], errors="coerce")
-                        picked = picked[(turn >= 5.0) & (turn <= 15.0) & (gap >= 0.04) & (gap <= 0.07)]
-                        picked = picked.reset_index(drop=True)
+                    source = str(spot.attrs.get("snapshot_source", "未知"))
+                    open_ready = bool(spot.attrs.get("open_ready"))
+                    picker.log_info(f"全市场快照来源：{source}，共 {len(spot)} 行。今开{'已刷新' if open_ready else '尚未刷新'}。")
+                    picked = None
+                    if not open_ready:
+                        st.warning("⏱️ 今开价尚未刷新，这次不能用来算高开。请约 15 秒后再点一次，避免把未刷新的行情当成没有买点。")
+                    else:
+                        picked = picker.match_weak_to_strong(candidates, spot)
+                        if picked is not None and not picked.empty:
+                            turn = pd.to_numeric(picked["换手率"], errors="coerce")
+                            gap = pd.to_numeric(picked["高开幅度"], errors="coerce")
+                            picked = picked[(turn >= 5.0) & (turn <= 15.0) & (gap >= 0.04) & (gap <= 0.07)]
+                            picked = picked.reset_index(drop=True)
 
-                    if picked is None or picked.empty:
+                    if not open_ready:
+                        pass
+                    elif picked is None or picked.empty:
                         st.error("😭 竞价结束，未发现符合高开 4%-7%、昨日换手 5%-15% 的股票。执行纪律：管住手！")
                     else:
                         st.success(f"🎉 狙击成功！WZ Breaker 发现 {len(picked)} 只符合黄金买点的标的！")
@@ -911,9 +952,10 @@ if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
     else:
         with st.spinner("WZ Breaker 正在扫描尾盘强资金抢筹标的..."):
             try:
-                df_spot = get_spot_data_with_retry(need_ohlc=True)
+                df_spot = get_spot_data_with_retry(need_ohlc=False)
                 if df_spot is None or df_spot.empty:
                     raise ValueError("全市场行情接口返回为空")
+                st.caption(f"本次快照：{df_spot.attrs.get('snapshot_source', '未知')}，共 {len(df_spot)} 只。价格来自东财或新浪，腾讯只补换手率。")
 
                 df = df_spot.copy()
                 df["代码"] = _normalize_code_series(df["代码"])
