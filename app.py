@@ -253,6 +253,25 @@ def _fill_derived_prices(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+_SNAPSHOT_NUMERIC = [
+    "最新价",
+    "涨跌幅",
+    "涨跌额",
+    "换手率",
+    "最高",
+    "最低",
+    "今开",
+    "昨收",
+    "成交量",
+    "成交额",
+    "量比",
+    "总市值",
+    "市盈率-动态",
+    "60日涨跌幅",
+    "年初至今涨跌幅",
+]
+
+
 def _try_fetch_spot(fetcher, desc: str, max_retries: int, delay: float):
     last_error = None
     for attempt in range(1, max_retries + 1):
@@ -271,6 +290,103 @@ def _try_fetch_spot(fetcher, desc: str, max_retries: int, delay: float):
     raise RuntimeError(f"{desc}连续失败 {max_retries} 次：{last_error}")
 
 
+def _normalize_em_spot(raw: pd.DataFrame) -> pd.DataFrame:
+    """东财快照列名已经是中文，这里只统一代码和数字类型。"""
+    df = raw.copy()
+    if "代码" not in df.columns:
+        raise ValueError(f"东财行情缺少代码字段，实际列名：{list(raw.columns)}")
+    df["代码"] = _normalize_code_series(df["代码"])
+    return _to_numeric_cols(df, [c for c in _SNAPSHOT_NUMERIC if c in df.columns])
+
+
+def _map_backup_to_em_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """把新浪/腾讯列名洗成东财格式，缺的价格用现价和涨跌幅补上。"""
+    df = _fill_derived_prices(df)
+    if "最低" not in df.columns:
+        df["最低"] = pd.NA
+    if "最高" not in df.columns:
+        df["最高"] = pd.NA
+    if "换手率" not in df.columns:
+        df["换手率"] = pd.NA
+    if "名称" not in df.columns:
+        df["名称"] = df["代码"].astype(str)
+    df = _to_numeric_cols(df, [c for c in _SNAPSHOT_NUMERIC if c in df.columns])
+    return df
+
+
+def _merge_backup_snapshots(sina_df: pd.DataFrame | None, tx_df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """新浪提供今开/昨收/最高/最低，腾讯补换手率、量比、市值和资金流。"""
+    if sina_df is None and tx_df is None:
+        return None
+    if sina_df is None:
+        return _map_backup_to_em_columns(tx_df)
+    if tx_df is None:
+        return _map_backup_to_em_columns(sina_df)
+
+    fill_cols = [
+        c
+        for c in [
+            "换手率",
+            "量比",
+            "总市值",
+            "60日涨跌幅",
+            "年初至今涨跌幅",
+            "主力净流入_快照",
+            "五日主力净流入",
+            "市盈率-动态",
+            "最高",
+            "最低",
+            "今开",
+            "昨收",
+            "最新价",
+            "涨跌幅",
+            "成交额",
+            "名称",
+        ]
+        if c in tx_df.columns
+    ]
+    extra = tx_df[["代码", *fill_cols]].drop_duplicates("代码")
+    merged = sina_df.merge(extra, on="代码", how="left", suffixes=("", "_tx"))
+    for col in fill_cols:
+        alt = f"{col}_tx"
+        if alt not in merged.columns:
+            continue
+        if col not in merged.columns:
+            merged[col] = merged[alt]
+        else:
+            base = pd.to_numeric(merged[col], errors="coerce") if col != "名称" else merged[col]
+            incoming = merged[alt]
+            if col != "名称":
+                incoming = pd.to_numeric(incoming, errors="coerce")
+                merged[col] = base.where(base.notna(), incoming)
+            else:
+                merged[col] = base.where(base.notna() & (base.astype(str) != ""), incoming)
+        merged = merged.drop(columns=[alt])
+    return _map_backup_to_em_columns(merged)
+
+
+def _fetch_eastmoney_spot(max_retries: int = 3) -> pd.DataFrame | None:
+    """引擎 A：东财全市场快照。失败后随机停 1~3 秒再试，最多 3 次。"""
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"正在获取东方财富全市场行情（第 {attempt}/{max_retries} 次）...")
+            df = ak.stock_zh_a_spot_em()
+            if df is None or df.empty:
+                raise ValueError("接口返回了空表格")
+            print(f"东方财富全市场行情完成，共 {len(df)} 行。")
+            return _normalize_em_spot(df)
+        except Exception as exc:
+            last_error = exc
+            print(f"警告：东方财富失败（第 {attempt}/{max_retries} 次）：{exc}")
+            if attempt < max_retries:
+                wait = random.uniform(1, 3)
+                print(f"随机休眠 {wait:.1f} 秒后重试东方财富...")
+                time.sleep(wait)
+    print(f"东方财富连续失败 {max_retries} 次，切换新浪/腾讯备用线路：{last_error}")
+    return None
+
+
 def _beijing_now() -> datetime:
     return datetime.now(timezone(timedelta(hours=8)))
 
@@ -287,48 +403,51 @@ def _block_if_weekend() -> bool:
 
 def get_spot_data_with_retry(max_retries=3, delay=2, need_ohlc=False) -> pd.DataFrame:
     """
-    全市场快照：优先腾讯 ak.stock_zh_a_spot_tx()，失败再走新浪 ak.stock_zh_a_spot()。
-    不再使用东方财富 stock_zh_a_spot_em，避免 Connection aborted。
-    need_ohlc=True 时会再补一次新浪，用于模块三需要的今开、昨收、最高。
-    """
-    tx_df = None
-    sina_df = None
-    errors = []
+    全市场实时快照。
 
+    引擎 A：东方财富 ak.stock_zh_a_spot_em()，失败后随机休眠 1~3 秒，最多 3 次。
+    引擎 B：东财连续失败后不中断，改走新浪 ak.stock_zh_a_spot()，再用腾讯补换手率等字段。
+    返回列名与东财对齐：代码、名称、最新价、涨跌幅、换手率、最高、最低、今开、昨收。
+    need_ohlc 保留给调用方；东财和新浪本身带开高低收，备用合并时也会补齐。
+    """
     try:
-        tx_df = _try_fetch_spot(
-            lambda: _normalize_tencent_spot(ak.stock_zh_a_spot_tx()),
-            desc="获取腾讯全市场行情",
+        em_df = _fetch_eastmoney_spot(max_retries=max_retries)
+        if em_df is not None and not em_df.empty:
+            return _map_backup_to_em_columns(em_df)
+    except Exception as exc:
+        print(f"警告：东方财富主干道异常，转入备用线路：{exc}")
+
+    sina_df = None
+    tx_df = None
+    errors = []
+    try:
+        sina_df = _try_fetch_spot(
+            lambda: _normalize_sina_spot(ak.stock_zh_a_spot()),
+            desc="获取新浪全市场行情",
             max_retries=max_retries,
             delay=delay,
         )
     except Exception as exc:
         errors.append(str(exc))
-        print(f"警告：腾讯接口不可用，准备切换新浪：{exc}")
+        print(f"警告：新浪备用线路不可用：{exc}")
 
-    should_fetch_sina = tx_df is None or need_ohlc
-    if should_fetch_sina:
-        sina_retries = 1 if tx_df is not None else max_retries
-        try:
-            sina_df = _try_fetch_spot(
-                lambda: _normalize_sina_spot(ak.stock_zh_a_spot()),
-                desc="获取新浪全市场行情",
-                max_retries=sina_retries,
-                delay=delay,
-            )
-        except Exception as exc:
-            errors.append(str(exc))
-            print(f"警告：新浪接口不可用：{exc}")
+    try:
+        tx_retries = 1 if sina_df is not None else max_retries
+        tx_df = _try_fetch_spot(
+            lambda: _normalize_tencent_spot(ak.stock_zh_a_spot_tx()),
+            desc="获取腾讯全市场行情",
+            max_retries=tx_retries,
+            delay=delay,
+        )
+    except Exception as exc:
+        errors.append(str(exc))
+        print(f"警告：腾讯备用线路不可用：{exc}")
 
-    if tx_df is not None and sina_df is not None:
-        ohlc_cols = [c for c in ["代码", "今开", "昨收", "最高", "最低"] if c in sina_df.columns]
-        merged = tx_df.merge(sina_df[ohlc_cols].drop_duplicates("代码"), on="代码", how="left")
-        return _fill_derived_prices(merged)
-    if tx_df is not None:
-        return _fill_derived_prices(tx_df)
-    if sina_df is not None:
-        return _fill_derived_prices(sina_df)
-    raise RuntimeError("腾讯与新浪全市场行情均失败：{}".format("；".join(errors)))
+    merged = _merge_backup_snapshots(sina_df, tx_df)
+    if merged is not None and not merged.empty:
+        print(f"已切换到备用行情，共 {len(merged)} 行。")
+        return merged
+    raise RuntimeError("东方财富、新浪、腾讯全市场行情均失败：{}".format("；".join(errors) or "无可用数据"))
 
 
 def _market_of_code(code: str) -> str:
@@ -728,8 +847,8 @@ if st.button("🔫 启动 9:25 终极选股策略"):
                     )
                     st.write(f"👀 进入今日竞价观察的候选：**{len(candidates)}** 只。{preview}")
 
-                    # 核心：模块二仍走东方财富全市场快照（该接口对竞价时段可用）
-                    spot = picker.fetch_today_spot()
+                    # 东财优先；连续 3 次失败后自动改用新浪/腾讯，列名已洗成今开/昨收
+                    spot = get_spot_data_with_retry(need_ohlc=True)
                     picked = picker.match_weak_to_strong(candidates, spot)
                     if picked is not None and not picked.empty:
                         turn = pd.to_numeric(picked["换手率"], errors="coerce")
@@ -806,11 +925,11 @@ if st.button("🛒 启动 14:50 尾盘抢筹扫描"):
                 df = df[~df["代码"].str.startswith("301")]
                 df = df[(df["涨跌幅"] >= 3.0) & (df["涨跌幅"] <= 5.0)]
                 df = df[(df["最新价"] < 8) | (df["最新价"] > 15)]
-                if "换手率" in df.columns:
+                if "换手率" in df.columns and df["换手率"].notna().any():
                     df = df[df["换手率"] >= 5.0]
-                if "最高" in df.columns:
-                    df = df[df["最高"] > 0]
-                    df = df[df["最新价"] >= df["最高"] * 0.985]
+                if "最高" in df.columns and df["最高"].notna().any():
+                    df = df[df["最高"].isna() | (df["最高"] > 0)]
+                    df = df[df["最高"].isna() | (df["最新价"] >= df["最高"] * 0.985)]
 
                 if "成交额" in df.columns:
                     df["成交额(亿)"] = _amount_to_yi(df["成交额"])
@@ -938,7 +1057,7 @@ if st.button("📡 启动趋势雷达扫描"):
                     df["成交额"] = pd.to_numeric(df["成交额"], errors="coerce")
                     cutoff = df["成交额"].quantile(0.7)
                     df = df[df["成交额"] >= cutoff]
-                if "换手率" in df.columns:
+                if "换手率" in df.columns and df["换手率"].notna().any():
                     df = df[df["换手率"] >= 5.0]
 
                 if "成交额" in df.columns:
@@ -1030,7 +1149,7 @@ if st.button("🔭 启动中长线价值雷达扫描"):
                     df = df[df["总市值"] >= 10000000000]
                 if "60日涨跌幅" in df.columns:
                     df = df[(df["60日涨跌幅"] >= 10) & (df["60日涨跌幅"] <= 40)]
-                if "换手率" in df.columns:
+                if "换手率" in df.columns and df["换手率"].notna().any():
                     df = df[(df["换手率"] >= 1.0) & (df["换手率"] <= 8.0)]
 
                 show_cols = [
