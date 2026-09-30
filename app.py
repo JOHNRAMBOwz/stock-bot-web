@@ -655,16 +655,22 @@ st.sidebar.button("🔐 验证并登录")
 # 用户数据库：激活码 -> 到期日期
 VIP_DATABASE = {
     "niuniu888": "2026-12-31",
-    "test001": "2026-9-30",
+    "test001": "2026-10-30",
 }
 
 code = (activation_code or "").strip()
+
+_mobile_login_hint = (
+    "📱 手机登录：请先点击页面左上角的「>>」打开侧边栏，"
+    "在里面输入激活码，再点「验证并登录」。电脑用户直接在左侧栏输入即可。"
+)
 
 if not code:
     st.sidebar.info("👆 请在上方输入激活码，并点击验证以解锁系统。")
     st.sidebar.info("购买激活码请联系管理员微信。")
     st.sidebar.markdown("**微信：azxc139210**")
-    st.warning("⚠️ 欢迎来到 WZ Breaker - A股情绪动量模型。请输入 VIP 激活码后按回车，或点击左侧「验证并登录」。")
+    st.info(_mobile_login_hint)
+    st.warning("⚠️ 欢迎来到 WZ Breaker - A股情绪动量模型。请输入 VIP 激活码后按回车，或在侧边栏点击「验证并登录」。")
     st.markdown("购买激活码请联系管理员微信。")
     st.markdown("**微信：azxc139210**")
     st.stop()
@@ -673,6 +679,7 @@ if code not in VIP_DATABASE:
     st.sidebar.error("❌ 激活码错误或不存在，请检查大小写！")
     st.sidebar.info("购买激活码请联系管理员微信。")
     st.sidebar.markdown("**微信：azxc139210**")
+    st.info(_mobile_login_hint)
     st.warning("⚠️ 欢迎来到 WZ Breaker - A股情绪动量模型。请输入有效的 VIP 激活码以解锁选股策略。")
     st.markdown("购买激活码请联系管理员微信。")
     st.markdown("**微信：azxc139210**")
@@ -684,6 +691,8 @@ today = date.today()  # 等价于 datetime.date.today()
 
 if today > expire_date:
     st.sidebar.error("您的激活码已过期，请续费")
+    st.info(_mobile_login_hint)
+    st.error("您的激活码已过期，请续费。手机请先点左上角「>>」打开侧边栏。")
     st.stop()
 
 st.sidebar.success("🟢 尊贵的 VIP，验证通过！")
